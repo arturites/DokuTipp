@@ -1,0 +1,1 @@
+"""DokuTipp command-line package."""

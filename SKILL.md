@@ -1,6 +1,6 @@
 ---
 name: dokutipp
-description: On-demand German public-media documentary picks filtered against a personal profile, delivered via the configured output channel
+description: Legacy, deprecated OpenClaw integration for German public-media documentary picks; use the standalone dokutipp CLI as the primary interface
 metadata:
   openclaw:
     os: ["linux"]
@@ -11,6 +11,11 @@ metadata:
 ---
 
 # DokuTipp
+
+> **Legacy integration (deprecated):** DokuTipp is now primarily a standalone
+> CLI. Agents should invoke `dokutipp` directly. This OpenClaw skill remains
+> for compatibility, is no longer the primary integration path, and may be
+> removed in a future major release.
 
 ## Preconditions
 
@@ -72,10 +77,19 @@ Do not begin any data fetching, downloading, or LLM calls before this message ha
 
 ## Data Source
 
-Run the following command to generate the input JSON:
+Use the following compatibility wrapper to generate the input JSON. It keeps
+this legacy source-checkout integration executable without requiring a package
+installation:
 
 ```bash
 python3 scripts/start_curation.py
+```
+
+When the standalone CLI is installed, agents should prefer the equivalent
+primary interface:
+
+```bash
+dokutipp
 ```
 
 The output is passed directly into the prompt. Each entry contains:
@@ -185,7 +199,7 @@ Note: The recommendation text must be written in **German**, even though this te
 
 | Situation | Action |
 |---|---|
-| `python3` not found | Instruct user to install python3 |
+| `python3` not found | Instruct user to install python3. |
 | `start_curation.py` download fails | `start_curation.py` exits with a non-zero code and prints the error. Abort and report to the user. |
 | Parser returns empty JSON | Report no results. Do not fall back to web search or invent entries. |
 | `PROFILE.md` missing | Run the onboarding flow defined in the Preconditions section. |
