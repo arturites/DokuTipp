@@ -1,12 +1,14 @@
+import io
 import json
 import lzma
 import os
 import runpy
-import subprocess
 import sys
 import tempfile
 import time
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from datetime import date
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -16,107 +18,674 @@ SOURCE_ROOT = REPOSITORY_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from dokutipp import cli, parser
+from dokutipp import cli, parser, selection
+from dokutipp.rendering import format_duration, render_recommendations
+from dokutipp.selection import (
+    CANDIDATE_HASH_FIELDS,
+    EXTRA_ID_PREFIX,
+    SelectionError,
+    build_candidate_registry,
+    candidate_id,
+    parse_selection_argument,
+    resolve_selection,
+)
 
 
-class CliDefaultsTests(unittest.TestCase):
-    def capture_workflow(self, invoke):
-        commands = []
+class CandidateIdTests(unittest.TestCase):
+    def test_candidate_id_is_stable_for_non_identity_changes_and_mapping_order(self):
+        candidate = make_candidate(
+            "Stable documentary",
+            channel="ARTE.DE",
+            date="10.08.2026",
+            duration="01:02:03",
+            description="Original synopsis.",
+            website="https://example.invalid/stable",
+        )
+        reordered_candidate = {
+            "website": candidate["website"],
+            "description": candidate["description"],
+            "duration": candidate["duration"],
+            "date": candidate["date"],
+            "channel": candidate["channel"],
+            "title": candidate["title"],
+        }
+        changed_description = dict(candidate, description="Updated synopsis.")
+        with_unrelated_data = dict(candidate, internal_note="not part of identity")
 
-        def fake_subprocess_run(command, **kwargs):
-            commands.append((command, kwargs))
-            return Mock(returncode=0)
+        identifier = candidate_id(candidate)
 
-        with patch.object(cli, "needs_download", return_value=False):
-            with patch.object(cli, "log"):
-                with patch.object(
-                    cli.subprocess, "run", side_effect=fake_subprocess_run
-                ):
-                    invoke()
+        self.assertEqual(
+            identifier,
+            "5027a85a3d96931a74c6af12e60c7259413f1d433b80e3a4ae72047e565d689e",
+        )
+        self.assertEqual(len(identifier), 64)
+        self.assertRegex(identifier, r"^[0-9a-f]{64}$")
+        self.assertEqual(identifier, candidate_id(reordered_candidate))
+        self.assertEqual(identifier, candidate_id(changed_description))
+        self.assertEqual(identifier, candidate_id(with_unrelated_data))
 
-        return commands
+    def test_candidate_id_changes_when_any_identity_field_changes(self):
+        candidate = make_candidate("Identity documentary")
+        original_identifier = candidate_id(candidate)
 
-    def test_bare_cli_matches_legacy_default_workflow(self):
-        legacy_data_dir = REPOSITORY_ROOT / "data"
-        legacy_workflow = self.capture_workflow(
-            lambda: cli.run_default(data_dir=legacy_data_dir)
+        for field in CANDIDATE_HASH_FIELDS:
+            with self.subTest(field=field):
+                changed = dict(candidate)
+                changed[field] = f"{changed[field]} changed"
+                self.assertNotEqual(original_identifier, candidate_id(changed))
+
+    def test_missing_and_none_identity_values_are_both_empty_strings(self):
+        missing_values = {}
+        none_values = {field: None for field in CANDIDATE_HASH_FIELDS}
+
+        self.assertEqual(candidate_id(missing_values), candidate_id(none_values))
+
+    def test_registry_rejects_candidates_with_an_ambiguous_hash_collision(self):
+        first = make_candidate("Collision documentary", description="First synopsis.")
+        second = dict(first, description="Different synopsis, same identity fields.")
+
+        self.assertEqual(candidate_id(first), candidate_id(second))
+        with self.assertRaisesRegex(SelectionError, "Ambiguous candidate ID"):
+            build_candidate_registry([first, second])
+
+
+class FetchPayloadTests(unittest.TestCase):
+    def setUp(self):
+        self.candidates = [
+            make_candidate(
+                "One",
+                channel="ARD",
+                description="First source synopsis.",
+                website="https://example.invalid/one",
+            ),
+            make_candidate(
+                "Two",
+                channel="ZDF",
+                description="Second source synopsis.",
+                website="https://example.invalid/two",
+            ),
+            make_candidate(
+                "Three",
+                channel="ARTE.DE",
+                description="Third source synopsis.",
+                website="https://example.invalid/three",
+            ),
+            make_candidate(
+                "Extra",
+                channel="ARD",
+                description="Extra source synopsis.",
+                website="https://example.invalid/extra",
+            ),
+        ]
+
+    def test_fetch_ready_outputs_machine_readable_ids_without_urls(self):
+        output = io.StringIO()
+        data_dir = Path("/tmp/dokutipp-fetch-data")
+        with patch.object(cli, "load_candidates", return_value=self.candidates) as load:
+            payload = cli.run_fetch(
+                data_dir=data_dir,
+                limit=17,
+                min_duration=55,
+                channels=("ZDF", "ARTE.DE"),
+                output=output,
+                today=date(2026, 8, 12),
+            )
+
+        load.assert_called_once_with(
+            data_dir=data_dir,
+            limit=17,
+            min_duration=55,
+            channels=("ZDF", "ARTE.DE"),
+        )
+        self.assertEqual(payload["status"], "ready")
+        self.assertNotIn("message", payload)
+        self.assertEqual(
+            payload["selection"],
+            {
+                "normal_recommendations": 3,
+                "extra_recommendations": 1,
+                "extra_id_prefix": "x",
+                "argument_format": "ID1,ID2,ID3,xID4",
+            },
+        )
+        self.assertEqual(
+            payload["filters"],
+            {"limit": 17, "min_duration": 55, "channels": ["ZDF", "ARTE.DE"]},
+        )
+        self.assertEqual(
+            [candidate["id"] for candidate in payload["candidates"]],
+            [candidate_id(candidate) for candidate in self.candidates],
+        )
+        self.assertEqual(json.loads(output.getvalue()), payload)
+        self.assertNotIn("website", payload["candidates"][0])
+        self.assertNotIn(self.candidates[0]["website"], output.getvalue())
+
+    def test_fetch_reports_no_and_insufficient_candidates_without_urls(self):
+        cases = [
+            ([], "no_candidates", "Keine passenden Dokumentationen"),
+            (
+                self.candidates[:3],
+                "insufficient_candidates",
+                "3 von 4 benötigt",
+            ),
+        ]
+
+        for candidates, expected_status, expected_message in cases:
+            with self.subTest(status=expected_status):
+                output = io.StringIO()
+                with patch.object(cli, "load_candidates", return_value=candidates):
+                    payload = cli.run_fetch(
+                        output=output,
+                        today=date(2026, 8, 12),
+                    )
+
+                self.assertEqual(payload["status"], expected_status)
+                self.assertIn(expected_message, payload["message"])
+                self.assertEqual(json.loads(output.getvalue()), payload)
+                self.assertNotIn("website", output.getvalue())
+                for candidate in candidates:
+                    self.assertNotIn(candidate["website"], output.getvalue())
+
+
+class SelectionArgumentTests(unittest.TestCase):
+    def setUp(self):
+        self.candidates = [
+            make_candidate("One", website="https://example.invalid/one"),
+            make_candidate("Two", website="https://example.invalid/two"),
+            make_candidate("Three", website="https://example.invalid/three"),
+            make_candidate("Extra", website="https://example.invalid/extra"),
+        ]
+        self.identifiers = [candidate_id(candidate) for candidate in self.candidates]
+
+    def test_extra_id_is_accepted_at_every_position_and_normal_order_is_preserved(self):
+        normal_ids = [
+            self.identifiers[2],
+            self.identifiers[0],
+            self.identifiers[1],
+        ]
+        extra_id = self.identifiers[3]
+
+        for extra_position in range(4):
+            with self.subTest(extra_position=extra_position):
+                parts = list(normal_ids)
+                parts.insert(extra_position, f"{EXTRA_ID_PREFIX}{extra_id}")
+                selection_argument = ", ".join(parts)
+
+                parsed_normal_ids, parsed_extra_id = parse_selection_argument(
+                    selection_argument
+                )
+                resolved = resolve_selection(selection_argument, self.candidates)
+
+                self.assertEqual(parsed_normal_ids, tuple(normal_ids))
+                self.assertEqual(parsed_extra_id, extra_id)
+                self.assertEqual(
+                    [candidate["title"] for candidate in resolved.recommendations],
+                    ["Three", "One", "Two"],
+                )
+                self.assertEqual(resolved.extra_recommendation["title"], "Extra")
+
+    def test_parser_rejects_every_selection_argument_validation_error(self):
+        one, two, three, extra = self.identifiers
+        cases = [
+            (
+                "wrong number of IDs",
+                f"{one},{two},x{extra}",
+                "exactly four",
+            ),
+            (
+                "empty ID",
+                f"{one},,{two},x{extra}",
+                "empty candidate ID",
+            ),
+            (
+                "no extra ID",
+                f"{one},{two},{three},{extra}",
+                "exactly one extra",
+            ),
+            (
+                "two extra IDs",
+                f"x{one},x{two},{three},{extra}",
+                "exactly one extra",
+            ),
+            (
+                "uppercase extra prefix",
+                f"{one},{two},{three},X{extra}",
+                "exactly one extra",
+            ),
+            (
+                "short hash",
+                f"{one[:-1]},{two},{three},x{extra}",
+                "complete lowercase SHA-256",
+            ),
+            (
+                "uppercase hash",
+                f"{one.upper()},{two},{three},x{extra}",
+                "complete lowercase SHA-256",
+            ),
+            (
+                "malformed extra hash",
+                f"{one},{two},{three},x{'a' * 63}",
+                "complete lowercase SHA-256",
+            ),
+            (
+                "duplicate normal ID",
+                f"{one},{one},{three},x{extra}",
+                "duplicate candidate ID",
+            ),
+            (
+                "extra duplicates a normal ID",
+                f"{one},{two},{three},x{three}",
+                "duplicate candidate ID",
+            ),
+        ]
+
+        for name, selection_argument, expected_error in cases:
+            with self.subTest(name=name):
+                with self.assertRaisesRegex(SelectionError, expected_error):
+                    parse_selection_argument(selection_argument)
+
+    def test_parser_defensively_rejects_an_unexpected_normal_id_count(self):
+        one, two, three, extra = self.identifiers
+        selection_argument = f"{one},{two},{three},x{extra}"
+
+        with patch.object(selection, "NORMAL_RECOMMENDATION_COUNT", 2):
+            with self.assertRaisesRegex(SelectionError, "exactly 2 normal"):
+                parse_selection_argument(selection_argument)
+
+    def test_resolver_rejects_unknown_but_well_formed_id(self):
+        one, two, _three, extra = self.identifiers
+        unknown = candidate_id(make_candidate("Not in this fetch"))
+        self.assertNotIn(unknown, self.identifiers)
+        selection_argument = f"{one},{two},{unknown},x{extra}"
+
+        with self.assertRaisesRegex(SelectionError, "Unknown candidate ID"):
+            resolve_selection(selection_argument, self.candidates)
+
+
+class RenderingTests(unittest.TestCase):
+    def setUp(self):
+        self.candidates = [
+            make_candidate(
+                "One",
+                channel="ARD",
+                duration="00:42:00",
+                description="First source description.",
+                website="https://example.invalid/one",
+            ),
+            make_candidate(
+                "Two",
+                channel="ZDF",
+                duration="01:05:00",
+                description="Second source description.",
+                website="https://example.invalid/two",
+            ),
+            make_candidate(
+                "Three",
+                channel="ARTE.DE",
+                duration="00:50:00",
+                description="Third source description.",
+                website="https://example.invalid/three",
+            ),
+            make_candidate(
+                "Extra",
+                channel="ARD",
+                duration="00:58:00",
+                description="Extra source description.",
+                website="https://example.invalid/extra",
+            ),
+        ]
+        identifiers = [candidate_id(candidate) for candidate in self.candidates]
+        self.selection = resolve_selection(
+            f"{identifiers[2]},{identifiers[0]},{identifiers[1]},x{identifiers[3]}",
+            self.candidates,
         )
 
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            original_cwd = Path.cwd()
-            try:
-                os.chdir(temporary_directory)
-                cli_workflow = self.capture_workflow(lambda: cli.main([]))
-            finally:
-                os.chdir(original_cwd)
+    def test_renderer_owns_complete_metadata_url_and_extra_presentation(self):
+        output = render_recommendations(self.selection, today=date(2026, 8, 12))
 
-        expected_command = [
-            sys.executable,
-            str(Path(cli.__file__).with_name("parser.py")),
-            str(legacy_data_dir / cli.FILMLISTE_FILENAME),
-            "--limit",
-            "1337",
-            "--min-duration",
-            "42",
+        self.assertIn("# 📺 DokuTipps der Woche – 2026-08-12", output)
+        self.assertIn("## Empfehlungen", output)
+        self.assertIn("### 1. 🎬 Three", output)
+        self.assertIn("### 2. 🎬 One", output)
+        self.assertIn("### 3. 🎬 Two", output)
+        self.assertIn("## 🔭 Extra-Empfehlung", output)
+        self.assertIn("### 🎬 Extra", output)
+        self.assertNotIn("### 4.", output)
+
+        expected_source_data = [
+            ("ARTE.DE", "50 Min.", "Third source description.", "three"),
+            ("ARD", "42 Min.", "First source description.", "one"),
+            ("ZDF", "1 Std. 5 Min.", "Second source description.", "two"),
+            ("ARD", "58 Min.", "Extra source description.", "extra"),
         ]
-        self.assertEqual(legacy_workflow, cli_workflow)
-        self.assertEqual(cli_workflow, [(expected_command, {"check": True})])
+        for channel, duration, description, url_suffix in expected_source_data:
+            with self.subTest(url_suffix=url_suffix):
+                self.assertIn(f"📡 Sender: {channel}", output)
+                self.assertIn(f"⏱ Laufzeit: {duration}", output)
+                self.assertIn("📅 Datum: 11.08.2026", output)
+                self.assertIn(description, output)
+                self.assertIn(
+                    f"[Zur Mediathek](https://example.invalid/{url_suffix})", output
+                )
 
-    def test_existing_filter_options_override_defaults(self):
+        positions = [
+            output.index("Third source description."),
+            output.index("First source description."),
+            output.index("Second source description."),
+        ]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_renderer_uses_deterministic_fallbacks_and_omits_absent_urls(self):
+        candidates = [
+            make_candidate(
+                "",
+                channel="",
+                date="",
+                duration="",
+                description="",
+                website="",
+            ),
+            make_candidate("No URL two", website=""),
+            make_candidate("No URL three", website=""),
+            make_candidate("No URL extra", website=""),
+        ]
+        identifiers = [candidate_id(candidate) for candidate in candidates]
+        resolved = resolve_selection(
+            f"{identifiers[0]},{identifiers[1]},{identifiers[2]},x{identifiers[3]}",
+            candidates,
+        )
+
+        output = render_recommendations(resolved, today=date(2026, 8, 12))
+
+        self.assertIn("### 1. 🎬 Ohne Titel", output)
+        self.assertIn("📡 Sender: unbekannt", output)
+        self.assertIn("⏱ Laufzeit: unbekannt", output)
+        self.assertIn("📅 Datum: unbekannt", output)
+        self.assertIn("Keine Beschreibung verfügbar.", output)
+        self.assertNotIn("[Zur Mediathek]", output)
+
+    def test_duration_formatting_is_deterministic(self):
+        self.assertEqual(format_duration("01:05:00"), "1 Std. 5 Min.")
+        self.assertEqual(format_duration("00:42:00"), "42 Min.")
+        self.assertEqual(format_duration("00:00:05"), "5 Sek.")
+        self.assertEqual(format_duration("00:00:00"), "0 Min.")
+        self.assertEqual(format_duration("not-a-duration"), "not-a-duration")
+        self.assertEqual(format_duration(""), "unbekannt")
+
+
+class CacheTests(unittest.TestCase):
+    def test_needs_download_respects_the_cache_age_threshold(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filmliste = Path(temporary_directory) / cli.FILMLISTE_FILENAME
+            self.assertTrue(cli.needs_download(filmliste))
+            filmliste.touch()
+            modified_at = filmliste.stat().st_mtime
+
+            with patch.object(cli.time, "time", return_value=modified_at + 1):
+                self.assertFalse(cli.needs_download(filmliste))
+            with patch.object(
+                cli.time,
+                "time",
+                return_value=modified_at + cli.MAX_AGE_SECONDS + 1,
+            ):
+                self.assertTrue(cli.needs_download(filmliste))
+
+    def test_ensure_filmliste_uses_fresh_cache_without_curl(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             data_dir = Path(temporary_directory) / "data"
-            workflow = self.capture_workflow(
-                lambda: cli.main(
+            stderr = io.StringIO()
+            with patch.object(cli, "needs_download", return_value=False):
+                with patch.object(cli.subprocess, "run") as curl:
+                    with redirect_stderr(stderr):
+                        filmliste = cli.ensure_filmliste(data_dir)
+
+        self.assertEqual(filmliste, data_dir / cli.FILMLISTE_FILENAME)
+        curl.assert_not_called()
+        self.assertIn("Filmliste-akt.xz is fresh", stderr.getvalue())
+
+    def test_ensure_filmliste_downloads_missing_or_stale_cache(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data_dir = Path(temporary_directory) / "data"
+            expected_filmliste = data_dir / cli.FILMLISTE_FILENAME
+            stderr = io.StringIO()
+            with patch.object(cli, "needs_download", return_value=True):
+                with patch.object(
+                    cli.subprocess, "run", return_value=Mock(returncode=0)
+                ) as curl:
+                    with redirect_stderr(stderr):
+                        filmliste = cli.ensure_filmliste(data_dir)
+
+        self.assertEqual(filmliste, expected_filmliste)
+        curl.assert_called_once_with(
+            ["curl", "-fsSL", "-o", str(expected_filmliste), cli.DOWNLOAD_URL]
+        )
+        self.assertIn("Downloading Filmliste-akt.xz", stderr.getvalue())
+        self.assertIn("Download complete", stderr.getvalue())
+
+    def test_ensure_filmliste_reports_a_failed_download(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data_dir = Path(temporary_directory) / "data"
+            stderr = io.StringIO()
+            with patch.object(cli, "needs_download", return_value=True):
+                with patch.object(
+                    cli.subprocess, "run", return_value=Mock(returncode=1)
+                ):
+                    with redirect_stderr(stderr):
+                        with self.assertRaises(SystemExit) as error:
+                            cli.ensure_filmliste(data_dir)
+
+        self.assertEqual(error.exception.code, 1)
+        self.assertIn("Download of Filmliste-akt.xz failed", stderr.getvalue())
+
+
+class CliIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self.candidates = [
+            make_candidate("One", website="https://example.invalid/one"),
+            make_candidate("Two", website="https://example.invalid/two"),
+            make_candidate("Three", website="https://example.invalid/three"),
+            make_candidate("Extra", website="https://example.invalid/extra"),
+        ]
+
+    def test_bare_cli_prints_help_to_stderr_and_exits_with_status_two(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as error:
+                cli.main([])
+
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("usage:", stderr.getvalue())
+        self.assertIn("fetch", stderr.getvalue())
+        self.assertIn("select", stderr.getvalue())
+
+    def test_load_candidates_reuses_the_existing_parser_filters(self):
+        filmliste = Path("/tmp/Filmliste-akt.xz")
+        with patch.object(cli, "ensure_filmliste", return_value=filmliste):
+            with patch.object(cli, "parse_filmliste", return_value=self.candidates) as parse:
+                result = cli.load_candidates(
+                    data_dir=Path("/tmp/data"),
+                    limit=12,
+                    min_duration=90,
+                    channels=("ZDF", "ARTE.DE"),
+                )
+
+        self.assertIs(result, self.candidates)
+        parse.assert_called_once_with(
+            filmliste,
+            limit=12,
+            min_duration=90,
+            channels=("ZDF", "ARTE.DE"),
+        )
+
+    def test_fetch_then_select_end_to_end_uses_stdout_for_results_and_stderr_for_logs(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data_dir = Path(temporary_directory) / "data"
+            data_dir.mkdir()
+            filmliste = data_dir / cli.FILMLISTE_FILENAME
+            now = int(time.time())
+            entries = [
+                make_entry(
+                    "ARD",
+                    "One",
+                    "00:42:00",
+                    now,
+                    description="First source description.",
+                    website="https://example.invalid/one",
+                ),
+                make_entry(
+                    "ZDF",
+                    "Two",
+                    "01:05:00",
+                    now,
+                    description="Second source description.",
+                    website="https://example.invalid/two",
+                ),
+                make_entry(
+                    "ARTE.DE",
+                    "Three",
+                    "00:50:00",
+                    now,
+                    description="Third source description.",
+                    website="https://example.invalid/three",
+                ),
+                make_entry(
+                    "ARD",
+                    "Extra",
+                    "00:58:00",
+                    now,
+                    description="Extra source description.",
+                    website="https://example.invalid/extra",
+                ),
+            ]
+            write_filmliste(filmliste, entries)
+
+            fetch_stdout = io.StringIO()
+            fetch_stderr = io.StringIO()
+            with redirect_stdout(fetch_stdout), redirect_stderr(fetch_stderr):
+                cli.main(
                     [
+                        "fetch",
                         "--limit",
-                        "12",
+                        "4",
                         "--min-duration",
-                        "90",
+                        "42",
                         "--channels",
+                        "ARD",
                         "ZDF",
                         "ARTE.DE",
                     ],
                     data_dir=data_dir,
                 )
+
+            fetch_payload = json.loads(fetch_stdout.getvalue())
+            candidate_ids = [candidate["id"] for candidate in fetch_payload["candidates"]]
+            selection_argument = ",".join(
+                [
+                    candidate_ids[2],
+                    f"{EXTRA_ID_PREFIX}{candidate_ids[3]}",
+                    candidate_ids[0],
+                    candidate_ids[1],
+                ]
             )
 
-        self.assertEqual(
-            workflow,
-            [
-                (
+            select_stdout = io.StringIO()
+            select_stderr = io.StringIO()
+            with redirect_stdout(select_stdout), redirect_stderr(select_stderr):
+                cli.main(
                     [
-                        sys.executable,
-                        str(Path(cli.__file__).with_name("parser.py")),
-                        str(data_dir / cli.FILMLISTE_FILENAME),
+                        "select",
+                        selection_argument,
                         "--limit",
-                        "12",
+                        "4",
                         "--min-duration",
-                        "90",
+                        "42",
                         "--channels",
+                        "ARD",
                         "ZDF",
                         "ARTE.DE",
                     ],
-                    {"check": True},
+                    data_dir=data_dir,
                 )
-            ],
+
+        self.assertEqual(fetch_payload["status"], "ready")
+        self.assertNotIn("https://example.invalid/one", fetch_stdout.getvalue())
+        self.assertNotIn("Filmliste-akt.xz is fresh", fetch_stdout.getvalue())
+        self.assertIn("Filmliste-akt.xz is fresh", fetch_stderr.getvalue())
+        self.assertTrue(select_stdout.getvalue().startswith("# 📺 DokuTipps der Woche"))
+        self.assertNotIn('"status"', select_stdout.getvalue())
+        self.assertNotIn("Filmliste-akt.xz is fresh", select_stdout.getvalue())
+        self.assertIn("Filmliste-akt.xz is fresh", select_stderr.getvalue())
+        self.assertLess(
+            select_stdout.getvalue().index("### 1. 🎬 Three"),
+            select_stdout.getvalue().index("### 2. 🎬 One"),
+        )
+        self.assertLess(
+            select_stdout.getvalue().index("### 2. 🎬 One"),
+            select_stdout.getvalue().index("### 3. 🎬 Two"),
+        )
+        self.assertIn("## 🔭 Extra-Empfehlung", select_stdout.getvalue())
+        self.assertIn(
+            "[Zur Mediathek](https://example.invalid/three)", select_stdout.getvalue()
+        )
+        self.assertIn(
+            "[Zur Mediathek](https://example.invalid/extra)", select_stdout.getvalue()
         )
 
-    def test_parser_preserves_default_filters_with_fresh_cache(self):
+    def test_select_validation_failure_writes_only_a_stderr_error(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with patch.object(cli, "load_candidates", return_value=self.candidates):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    cli.main(["select", "not-a-valid-selection"])
+
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Error: Selection must contain exactly four", stderr.getvalue())
+
+    def test_select_workflow_does_not_read_skill_md(self):
+        identifiers = [candidate_id(candidate) for candidate in self.candidates]
+        selection_argument = (
+            f"{identifiers[0]},{identifiers[1]},{identifiers[2]},"
+            f"x{identifiers[3]}"
+        )
+        output = io.StringIO()
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            original_cwd = Path.cwd()
+            try:
+                os.chdir(temporary_directory)
+                with patch.object(cli, "load_candidates", return_value=self.candidates):
+                    with patch.object(
+                        Path,
+                        "read_text",
+                        side_effect=AssertionError("SKILL.md must not be read"),
+                    ):
+                        cli.run_select(
+                            selection_argument,
+                            output=output,
+                            today=date(2026, 8, 12),
+                        )
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertIn("## 🔭 Extra-Empfehlung", output.getvalue())
+
+    def test_parser_preserves_default_documentary_filters(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             filmliste = Path(temporary_directory) / cli.FILMLISTE_FILENAME
             now = int(time.time())
-
             entries = [
-                self.make_entry("ARD", "Eligible documentary", "00:42:00", now),
-                self.make_entry("", "Too short", "00:41:00", now),
-                self.make_entry("ZDF", "Audiodeskription version", "00:50:00", now),
-                self.make_entry("ARTE.DE", "Too old", "00:50:00", now - 8 * 24 * 3600),
+                make_entry("ARD", "Eligible documentary", "00:42:00", now),
+                make_entry("", "Too short", "00:41:00", now),
+                make_entry("ZDF", "Audiodeskription version", "00:50:00", now),
+                make_entry("ARTE.DE", "Too old", "00:50:00", now - 8 * 24 * 3600),
+                make_entry("WDR", "Wrong channel", "00:50:00", now),
             ]
-            raw_data = "{\n" + ",\n".join(
-                '"X": ' + json.dumps(entry) for entry in entries
-            ) + "\n}\n"
-            with lzma.open(filmliste, "wt", encoding="utf-8") as file_handle:
-                file_handle.write(raw_data)
+            write_filmliste(filmliste, entries)
 
             results = parser.parse_filmliste(
                 filmliste,
@@ -127,70 +696,70 @@ class CliDefaultsTests(unittest.TestCase):
 
         self.assertEqual([entry["title"] for entry in results], ["Eligible documentary"])
 
-    def test_captured_stdout_preserves_legacy_subprocess_order(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            temporary_path = Path(temporary_directory)
-            data_dir = temporary_path / "data"
-            data_dir.mkdir()
-            filmliste = data_dir / cli.FILMLISTE_FILENAME
-            entry = self.make_entry(
-                "ARD", "Subprocess order fixture", "00:42:00", int(time.time())
-            )
-            with lzma.open(filmliste, "wt", encoding="utf-8") as file_handle:
-                file_handle.write('{"X": ' + json.dumps(entry) + "}")
+    def test_legacy_start_script_delegates_to_cli_main(self):
+        with patch.object(cli, "main") as main:
+            with patch.object(sys, "argv", ["start_curation.py", "--limit", "8"]):
+                runpy.run_path(
+                    str(REPOSITORY_ROOT / "scripts" / "start_curation.py"),
+                    run_name="__main__",
+                )
 
-            environment = os.environ.copy()
-            existing_python_path = environment.get("PYTHONPATH")
-            environment["PYTHONPATH"] = str(SOURCE_ROOT)
-            if existing_python_path:
-                environment["PYTHONPATH"] += os.pathsep + existing_python_path
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-c",
-                    (
-                        "from pathlib import Path; "
-                        "from dokutipp.cli import run_default; "
-                        "run_default(data_dir=Path('data'))"
-                    ),
-                ],
-                cwd=temporary_path,
-                env=environment,
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-
-        self.assertLess(
-            result.stdout.index('"title"'),
-            result.stdout.index("Filmliste-akt.xz is fresh"),
+        main.assert_called_once_with(
+            ["fetch", "--limit", "8"], data_dir=REPOSITORY_ROOT / "data"
         )
-
-    def test_legacy_start_script_delegates_to_shared_default(self):
-        with patch.object(cli, "run_default") as run_default:
-            runpy.run_path(
-                str(REPOSITORY_ROOT / "scripts" / "start_curation.py"),
-                run_name="__main__",
-            )
-
-        run_default.assert_called_once_with(data_dir=REPOSITORY_ROOT / "data")
 
     def test_legacy_parser_script_reexports_parser_helpers(self):
         namespace = runpy.run_path(
             str(REPOSITORY_ROOT / "scripts" / "parse_filmliste.py")
         )
+
         self.assertIs(namespace["parse_raw"], parser.parse_raw)
         self.assertIs(namespace["parse_filmliste"], parser.parse_filmliste)
 
-    @staticmethod
-    def make_entry(sender, title, duration, timestamp):
-        entry = [""] * 17
-        entry[0] = sender
-        entry[1] = "Documentaries"
-        entry[2] = title
-        entry[3] = "11.08.2026"
-        entry[5] = duration
-        entry[7] = "A test description."
-        entry[9] = "https://example.invalid/documentary"
-        entry[16] = str(timestamp)
-        return entry
+
+def make_candidate(
+    title,
+    *,
+    channel="ARD",
+    date="11.08.2026",
+    duration="00:42:00",
+    description="A source description.",
+    website="https://example.invalid/documentary",
+):
+    return {
+        "title": title,
+        "channel": channel,
+        "date": date,
+        "duration": duration,
+        "description": description,
+        "website": website,
+    }
+
+
+def make_entry(
+    sender,
+    title,
+    duration,
+    timestamp,
+    *,
+    description="A test description.",
+    website="https://example.invalid/documentary",
+):
+    entry = [""] * 17
+    entry[0] = sender
+    entry[1] = "Documentaries"
+    entry[2] = title
+    entry[3] = "11.08.2026"
+    entry[5] = duration
+    entry[7] = description
+    entry[9] = website
+    entry[16] = str(timestamp)
+    return entry
+
+
+def write_filmliste(path, entries):
+    raw_data = "{\n" + ",\n".join(
+        '"X": ' + json.dumps(entry) for entry in entries
+    ) + "\n}\n"
+    with lzma.open(path, "wt", encoding="utf-8") as file_handle:
+        file_handle.write(raw_data)

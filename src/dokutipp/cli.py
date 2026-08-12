@@ -1,14 +1,29 @@
 """Command-line orchestration for DokuTipp."""
 
+from __future__ import annotations
+
 import argparse
+import json
 import subprocess
 import sys
 import time
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence, TextIO
 
-from .parser import DEFAULT_CHANNELS
+from .parser import DEFAULT_CHANNELS, parse_filmliste
+from .rendering import (
+    render_insufficient_candidates,
+    render_no_candidates,
+    render_recommendations,
+)
+from .selection import (
+    SelectionError,
+    TOTAL_RECOMMENDATION_COUNT,
+    build_fetch_payload,
+    resolve_selection,
+)
+
 
 FILMLISTE_FILENAME = "Filmliste-akt.xz"
 DOWNLOAD_URL = "https://liste.mediathekview.de/Filmliste-akt.xz"
@@ -18,7 +33,11 @@ DEFAULT_MIN_DURATION = 42
 
 
 def log(message: str) -> None:
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}")
+    """Write operational progress away from command result stdout."""
+    print(
+        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}",
+        file=sys.stderr,
+    )
 
 
 def default_data_dir() -> Path:
@@ -56,72 +75,102 @@ def ensure_filmliste(data_dir: Path) -> Path:
     return filmliste
 
 
-def build_parser_command(
-    filmliste: Path,
-    *,
-    limit: int,
-    min_duration: int,
-    channels: Sequence[str],
-) -> list:
-    """Build the legacy parser subprocess invocation."""
-    command = [
-        sys.executable,
-        str(Path(__file__).with_name("parser.py")),
-        str(filmliste),
-        "--limit",
-        str(limit),
-        "--min-duration",
-        str(min_duration),
-    ]
-    if tuple(channels) != DEFAULT_CHANNELS:
-        command.extend(["--channels", *channels])
-    return command
-
-
-def run_curation(
+def load_candidates(
     *,
     data_dir: Optional[Path] = None,
     limit: int = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     channels: Sequence[str] = DEFAULT_CHANNELS,
-) -> None:
-    """Run the legacy download-and-filter workflow."""
+) -> list:
+    """Load the cache and reuse the existing MediathekView parser filters."""
     if data_dir is None:
         data_dir = default_data_dir()
-
     filmliste = ensure_filmliste(data_dir)
-    log("Starting parse_filmliste.py ...")
-    subprocess.run(
-        build_parser_command(
-            filmliste,
-            limit=limit,
-            min_duration=min_duration,
-            channels=channels,
-        ),
-        check=True,
+    return parse_filmliste(
+        filmliste,
+        limit=limit,
+        min_duration=min_duration,
+        channels=channels,
     )
 
 
-def run_default(*, data_dir: Optional[Path] = None) -> None:
-    """Run the exact defaults previously hard-coded in start_curation.py."""
-    run_curation(
+def run_fetch(
+    *,
+    data_dir: Optional[Path] = None,
+    limit: int = DEFAULT_LIMIT,
+    min_duration: int = DEFAULT_MIN_DURATION,
+    channels: Sequence[str] = DEFAULT_CHANNELS,
+    output: Optional[TextIO] = None,
+    today: Optional[date] = None,
+) -> Dict[str, Any]:
+    """Write the structured candidate set for agent-side ID selection."""
+    if output is None:
+        output = sys.stdout
+    if today is None:
+        today = date.today()
+
+    candidates = load_candidates(
         data_dir=data_dir,
-        limit=DEFAULT_LIMIT,
-        min_duration=DEFAULT_MIN_DURATION,
-        channels=DEFAULT_CHANNELS,
+        limit=limit,
+        min_duration=min_duration,
+        channels=channels,
     )
+    message = ""
+    if not candidates:
+        message = render_no_candidates(today=today)
+    elif len(candidates) < TOTAL_RECOMMENDATION_COUNT:
+        message = render_insufficient_candidates(
+            available=len(candidates),
+            required=TOTAL_RECOMMENDATION_COUNT,
+            today=today,
+        )
+
+    payload = build_fetch_payload(
+        candidates,
+        limit=limit,
+        min_duration=min_duration,
+        channels=channels,
+        message=message,
+    )
+    json.dump(payload, output, ensure_ascii=False, indent=2)
+    output.write("\n")
+    return payload
 
 
-def build_argument_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Download the MediathekView film list and output filtered documentary candidates as JSON."
+def run_select(
+    selection_argument: str,
+    *,
+    data_dir: Optional[Path] = None,
+    limit: int = DEFAULT_LIMIT,
+    min_duration: int = DEFAULT_MIN_DURATION,
+    channels: Sequence[str] = DEFAULT_CHANNELS,
+    output: Optional[TextIO] = None,
+    today: Optional[date] = None,
+) -> None:
+    """Resolve an agent selection and write the complete final Markdown."""
+    if output is None:
+        output = sys.stdout
+    if today is None:
+        today = date.today()
+
+    candidates = load_candidates(
+        data_dir=data_dir,
+        limit=limit,
+        min_duration=min_duration,
+        channels=channels,
     )
+    selection = resolve_selection(selection_argument, candidates)
+    output.write(render_recommendations(selection, today=today))
+
+
+def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the shared MediathekView filter options to one subcommand."""
     parser.add_argument(
         "--limit",
         type=int,
         default=DEFAULT_LIMIT,
         metavar="N",
-        help="Maximum number of output entries (default: 1337)",
+        help="Maximum number of filtered source candidates (default: 1337)",
     )
     parser.add_argument(
         "--min-duration",
@@ -137,6 +186,35 @@ def build_argument_parser() -> argparse.ArgumentParser:
         metavar="CHANNEL",
         help="Channels to include (default: ARD ZDF ARTE.DE)",
     )
+
+
+def build_argument_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Fetch MediathekView candidates or render a selected 3+1 DokuTipp result."
+        )
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    fetch_parser = subparsers.add_parser(
+        "fetch",
+        help="Output filtered candidates with stable IDs as JSON.",
+    )
+    add_filter_arguments(fetch_parser)
+
+    select_parser = subparsers.add_parser(
+        "select",
+        help="Validate selected IDs and output the final recommendations.",
+    )
+    select_parser.add_argument(
+        "ids",
+        metavar="IDS",
+        help=(
+            "Four comma-separated SHA-256 IDs; prefix exactly one extra "
+            "recommendation with lowercase 'x'."
+        ),
+    )
+    add_filter_arguments(select_parser)
     return parser
 
 
@@ -145,10 +223,36 @@ def main(
     *,
     data_dir: Optional[Path] = None,
 ) -> None:
-    args = build_argument_parser().parse_args(argv)
-    run_curation(
-        data_dir=data_dir,
-        limit=args.limit,
-        min_duration=args.min_duration,
-        channels=args.channels,
-    )
+    parser = build_argument_parser()
+    arguments = list(sys.argv[1:] if argv is None else argv)
+    if not arguments:
+        parser.print_help(file=sys.stderr)
+        raise SystemExit(2)
+
+    args = parser.parse_args(arguments)
+    try:
+        if args.command == "fetch":
+            run_fetch(
+                data_dir=data_dir,
+                limit=args.limit,
+                min_duration=args.min_duration,
+                channels=args.channels,
+            )
+        elif args.command == "select":
+            run_select(
+                args.ids,
+                data_dir=data_dir,
+                limit=args.limit,
+                min_duration=args.min_duration,
+                channels=args.channels,
+            )
+        else:
+            parser.print_help(file=sys.stderr)
+            raise SystemExit(2)
+    except SelectionError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        raise SystemExit(2)
+
+
+if __name__ == "__main__":
+    main()
