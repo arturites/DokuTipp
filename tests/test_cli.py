@@ -18,6 +18,7 @@ if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
 from dokutipp import cli, parser, selection
+from dokutipp.parser import FilterConfigError
 from dokutipp.rendering import format_duration, render_recommendations
 from dokutipp.selection import (
     CANDIDATE_HASH_FIELDS,
@@ -126,6 +127,7 @@ class FetchPayloadTests(unittest.TestCase):
                 limit=17,
                 min_duration=55,
                 channels=("ZDF", "ARTE.DE"),
+                filter_file=None,
                 output=output,
                 today=date(2026, 8, 12),
             )
@@ -135,6 +137,7 @@ class FetchPayloadTests(unittest.TestCase):
             limit=17,
             min_duration=55,
             channels=("ZDF", "ARTE.DE"),
+            filter_file=None,
         )
         self.assertEqual(payload["status"], "ready")
         self.assertNotIn("message", payload)
@@ -149,7 +152,12 @@ class FetchPayloadTests(unittest.TestCase):
         )
         self.assertEqual(
             payload["filters"],
-            {"limit": 17, "min_duration": 55, "channels": ["ZDF", "ARTE.DE"]},
+            {
+                "limit": 17,
+                "min_duration": 55,
+                "channels": ["ZDF", "ARTE.DE"],
+                "title_exclusions": ["Audiodeskription", "Mittagsmagazin"],
+            },
         )
         self.assertEqual(
             [candidate["id"] for candidate in payload["candidates"]],
@@ -502,6 +510,7 @@ class CliIntegrationTests(unittest.TestCase):
 
     def test_load_candidates_reuses_the_existing_parser_filters(self):
         filmliste = Path("/tmp/Filmliste-akt.xz")
+        filter_file = Path("/tmp/filters.txt")
         with patch.object(cli, "ensure_filmliste", return_value=filmliste):
             with patch.object(cli, "parse_filmliste", return_value=self.candidates) as parse:
                 result = cli.load_candidates(
@@ -509,6 +518,7 @@ class CliIntegrationTests(unittest.TestCase):
                     limit=12,
                     min_duration=90,
                     channels=("ZDF", "ARTE.DE"),
+                    filter_file=filter_file,
                 )
 
         self.assertIs(result, self.candidates)
@@ -517,6 +527,7 @@ class CliIntegrationTests(unittest.TestCase):
             limit=12,
             min_duration=90,
             channels=("ZDF", "ARTE.DE"),
+            filter_file=filter_file,
         )
 
     def test_fetch_then_select_end_to_end_uses_stdout_for_results_and_stderr_for_logs(self):
@@ -560,6 +571,11 @@ class CliIntegrationTests(unittest.TestCase):
                 ),
             ]
             write_filmliste(filmliste, entries)
+            filter_file = data_dir / "filters.txt"
+            filter_file.write_text(
+                "# No additional exclusions for this test\n",
+                encoding="utf-8",
+            )
 
             fetch_stdout = io.StringIO()
             fetch_stderr = io.StringIO()
@@ -575,6 +591,8 @@ class CliIntegrationTests(unittest.TestCase):
                         "ARD",
                         "ZDF",
                         "ARTE.DE",
+                        "--filter-file",
+                        str(filter_file),
                     ],
                     data_dir=data_dir,
                 )
@@ -605,6 +623,8 @@ class CliIntegrationTests(unittest.TestCase):
                         "ARD",
                         "ZDF",
                         "ARTE.DE",
+                        "--filter-file",
+                        str(filter_file),
                     ],
                     data_dir=data_dir,
                 )
@@ -645,6 +665,41 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("Error: Selection must contain exactly four", stderr.getvalue())
 
+    def test_invalid_filter_file_is_reported_as_cli_error(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_file = Path(temporary_directory) / "filters.txt"
+            filter_file.write_text("[unterminated", encoding="utf-8")
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with patch.object(cli, "load_candidates", return_value=[]):
+                with redirect_stdout(stdout), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as error:
+                        cli.main(
+                            ["fetch", "--filter-file", str(filter_file)]
+                        )
+
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Invalid title filter", stderr.getvalue())
+
+    def test_explicit_filter_file_is_used_for_fetch_metadata(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_file = Path(temporary_directory) / "filters.txt"
+            filter_file.write_text(
+                "# Ignore comments and blank lines\n\nMittags[- ]magazin\n",
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+
+            with patch.object(cli, "load_candidates", return_value=self.candidates):
+                payload = cli.run_fetch(
+                    filter_file=filter_file,
+                    output=output,
+                )
+
+        self.assertEqual(payload["filters"]["title_exclusions"], ["Mittags[- ]magazin"])
+
     def test_select_workflow_does_not_read_skill_md(self):
         identifiers = [candidate_id(candidate) for candidate in self.candidates]
         selection_argument = (
@@ -681,6 +736,7 @@ class CliIntegrationTests(unittest.TestCase):
                 make_entry("ARD", "Eligible documentary", "00:42:00", now),
                 make_entry("", "Too short", "00:41:00", now),
                 make_entry("ZDF", "Audiodeskription version", "00:50:00", now),
+                make_entry("ARD", "Mittagsmagazin", "00:50:00", now),
                 make_entry("ARTE.DE", "Too old", "00:50:00", now - 8 * 24 * 3600),
                 make_entry("WDR", "Wrong channel", "00:50:00", now),
             ]
@@ -694,6 +750,72 @@ class CliIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual([entry["title"] for entry in results], ["Eligible documentary"])
+
+    def test_parser_uses_case_insensitive_title_regexes_from_filter_file(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filmliste = Path(temporary_directory) / cli.FILMLISTE_FILENAME
+            filter_file = Path(temporary_directory) / "filters.txt"
+            now = int(time.time())
+            filter_file.write_text(
+                "# Title exclusions\n\nMittags[- ]?magazin\nEvening\\s+Report\n",
+                encoding="utf-8",
+            )
+            entries = [
+                make_entry(
+                    "ARD",
+                    "Documentary with context",
+                    "00:10:00",
+                    now,
+                    description="A Mittagsmagazin mention is only in the description.",
+                ),
+                make_entry("ZDF", "MITTAGSMAGAZIN Spezial", "00:10:00", now),
+                make_entry("ARD", "Evening Report: Europe", "00:10:00", now),
+                make_entry("ARTE.DE", "Audiodeskription version", "00:10:00", now),
+            ]
+            write_filmliste(filmliste, entries)
+
+            results = parser.parse_filmliste(
+                filmliste,
+                min_duration=0,
+                channels=parser.DEFAULT_CHANNELS,
+                filter_file=filter_file,
+            )
+
+        self.assertEqual(
+            [entry["title"] for entry in results],
+            ["Documentary with context", "Audiodeskription version"],
+        )
+
+    def test_filter_file_ignores_blank_and_comment_lines(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_file = Path(temporary_directory) / "filters.txt"
+            filter_file.write_text("\n  # comment\nMittagsmagazin\n", encoding="utf-8")
+
+            self.assertEqual(
+                parser.load_title_filters(filter_file),
+                ("Mittagsmagazin",),
+            )
+
+    def test_invalid_filter_regex_includes_file_and_line(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_file = Path(temporary_directory) / "filters.txt"
+            filter_file.write_text("Valid\n[invalid", encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                FilterConfigError,
+                r"Invalid title filter.*filters\.txt.*line 2",
+            ):
+                parser.load_title_filters(filter_file)
+
+    def test_missing_filter_file_is_reported(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_file = Path(temporary_directory) / "missing-filters.txt"
+
+            with self.assertRaisesRegex(
+                FilterConfigError, "Title filter file not found"
+            ):
+                parser.load_title_filters(filter_file)
+
 
 def make_candidate(
     title,

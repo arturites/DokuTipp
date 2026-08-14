@@ -64,6 +64,7 @@ def build_fetch_payload(
     limit: int,
     min_duration: int,
     channels: Sequence[str],
+    title_filters: Sequence[str] = (),
     message: str = "",
 ) -> Dict[str, Any]:
     """Build the machine-readable candidate payload emitted by fetch."""
@@ -100,6 +101,7 @@ def build_fetch_payload(
             "limit": limit,
             "min_duration": min_duration,
             "channels": list(channels),
+            "title_exclusions": list(title_filters),
         },
         "candidates": candidate_payload,
     }
@@ -180,4 +182,3 @@ def _text(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
-

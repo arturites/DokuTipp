@@ -11,7 +11,12 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, TextIO
 
-from .parser import DEFAULT_CHANNELS, parse_filmliste
+from .parser import (
+    DEFAULT_CHANNELS,
+    FilterConfigError,
+    load_title_filters,
+    parse_filmliste,
+)
 from .rendering import (
     render_insufficient_candidates,
     render_no_candidates,
@@ -81,6 +86,7 @@ def load_candidates(
     limit: int = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     channels: Sequence[str] = DEFAULT_CHANNELS,
+    filter_file: Optional[Path] = None,
 ) -> list:
     """Load the cache and reuse the existing MediathekView parser filters."""
     if data_dir is None:
@@ -91,6 +97,7 @@ def load_candidates(
         limit=limit,
         min_duration=min_duration,
         channels=channels,
+        filter_file=filter_file,
     )
 
 
@@ -100,6 +107,7 @@ def run_fetch(
     limit: int = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     channels: Sequence[str] = DEFAULT_CHANNELS,
+    filter_file: Optional[Path] = None,
     output: Optional[TextIO] = None,
     today: Optional[date] = None,
 ) -> Dict[str, Any]:
@@ -114,7 +122,9 @@ def run_fetch(
         limit=limit,
         min_duration=min_duration,
         channels=channels,
+        filter_file=filter_file,
     )
+    title_filters = load_title_filters(filter_file)
     message = ""
     if not candidates:
         message = render_no_candidates(today=today)
@@ -130,6 +140,7 @@ def run_fetch(
         limit=limit,
         min_duration=min_duration,
         channels=channels,
+        title_filters=title_filters,
         message=message,
     )
     json.dump(payload, output, ensure_ascii=False, indent=2)
@@ -144,6 +155,7 @@ def run_select(
     limit: int = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     channels: Sequence[str] = DEFAULT_CHANNELS,
+    filter_file: Optional[Path] = None,
     output: Optional[TextIO] = None,
     today: Optional[date] = None,
 ) -> None:
@@ -158,6 +170,7 @@ def run_select(
         limit=limit,
         min_duration=min_duration,
         channels=channels,
+        filter_file=filter_file,
     )
     selection = resolve_selection(selection_argument, candidates)
     output.write(render_recommendations(selection, today=today))
@@ -185,6 +198,13 @@ def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
         default=DEFAULT_CHANNELS,
         metavar="CHANNEL",
         help="Channels to include (default: ARD ZDF ARTE.DE)",
+    )
+    parser.add_argument(
+        "--filter-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Title exclusion regex file (default: filters.txt)",
     )
 
 
@@ -237,6 +257,7 @@ def main(
                 limit=args.limit,
                 min_duration=args.min_duration,
                 channels=args.channels,
+                filter_file=args.filter_file,
             )
         elif args.command == "select":
             run_select(
@@ -245,11 +266,12 @@ def main(
                 limit=args.limit,
                 min_duration=args.min_duration,
                 channels=args.channels,
+                filter_file=args.filter_file,
             )
         else:
             parser.print_help(file=sys.stderr)
             raise SystemExit(2)
-    except SelectionError as error:
+    except (FilterConfigError, SelectionError) as error:
         print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(2)
 

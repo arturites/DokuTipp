@@ -7,8 +7,16 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ## [Unreleased]
 
+### Added
+
+- Add a transparent, versioned `filters.txt` title-exclusion list with
+  case-insensitive regular-expression support and a `--filter-file` override.
+- Include the active title-exclusion patterns in the `fetch` filter metadata.
+
 ### Changed
 
+- Move the hard-coded `Audiodeskription` title exclusion into `filters.txt`,
+  where additional exclusions such as `Mittagsmagazin` can be maintained.
 - Make the installed `dokutipp` command, with its `fetch` and `select`
   subcommands, the only supported DokuTipp CLI entry point.
 - Document the package CLI exclusively in the README and agent integration.
