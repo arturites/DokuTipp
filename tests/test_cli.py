@@ -167,6 +167,18 @@ class FetchPayloadTests(unittest.TestCase):
         self.assertNotIn("website", payload["candidates"][0])
         self.assertNotIn(self.candidates[0]["website"], output.getvalue())
 
+    def test_cli_limit_defaults_to_no_limit(self):
+        arguments = cli.build_argument_parser().parse_args(["fetch"])
+
+        self.assertIsNone(arguments.limit)
+
+        output = io.StringIO()
+        with patch.object(cli, "load_candidates", return_value=self.candidates) as load:
+            cli.run_fetch(output=output, today=date(2026, 8, 12))
+
+        self.assertIsNone(load.call_args.kwargs["limit"])
+        self.assertIsNone(json.loads(output.getvalue())["filters"]["limit"])
+
     def test_fetch_reports_no_and_insufficient_candidates_without_urls(self):
         cases = [
             ([], "no_candidates", "Keine passenden Dokumentationen"),

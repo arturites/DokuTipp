@@ -140,7 +140,7 @@ The following options are available on both `fetch` and `select`:
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `--limit N` | `1337` | Maximum number of filtered source candidates. |
+| `--limit N` | no limit | Maximum number of filtered source candidates. |
 | `--min-duration MINUTES` | `42` | Exclude entries shorter than this duration. |
 | `--channels CHANNEL [CHANNEL ...]` | all channels | Broadcasters to include. |
 | `--filter-file PATH` | `filters.txt` | File with title-exclusion regular expressions. |

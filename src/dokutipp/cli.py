@@ -33,7 +33,7 @@ from .selection import (
 FILMLISTE_FILENAME = "Filmliste-akt.xz"
 DOWNLOAD_URL = "https://liste.mediathekview.de/Filmliste-akt.xz"
 MAX_AGE_SECONDS = 24 * 3600
-DEFAULT_LIMIT = 1337
+DEFAULT_LIMIT: Optional[int] = None
 DEFAULT_MIN_DURATION = 42
 
 
@@ -83,7 +83,7 @@ def ensure_filmliste(data_dir: Path) -> Path:
 def load_candidates(
     *,
     data_dir: Optional[Path] = None,
-    limit: int = DEFAULT_LIMIT,
+    limit: Optional[int] = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     channels: Sequence[str] = DEFAULT_CHANNELS,
     filter_file: Optional[Path] = None,
@@ -104,7 +104,7 @@ def load_candidates(
 def run_fetch(
     *,
     data_dir: Optional[Path] = None,
-    limit: int = DEFAULT_LIMIT,
+    limit: Optional[int] = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     channels: Sequence[str] = DEFAULT_CHANNELS,
     filter_file: Optional[Path] = None,
@@ -152,7 +152,7 @@ def run_select(
     selection_argument: str,
     *,
     data_dir: Optional[Path] = None,
-    limit: int = DEFAULT_LIMIT,
+    limit: Optional[int] = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     channels: Sequence[str] = DEFAULT_CHANNELS,
     filter_file: Optional[Path] = None,
@@ -183,7 +183,7 @@ def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=DEFAULT_LIMIT,
         metavar="N",
-        help="Maximum number of filtered source candidates (default: 1337)",
+        help="Maximum number of filtered source candidates (default: no limit)",
     )
     parser.add_argument(
         "--min-duration",

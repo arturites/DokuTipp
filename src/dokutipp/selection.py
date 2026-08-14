@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Sequence, Tuple
+from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
 
 
 NORMAL_RECOMMENDATION_COUNT = 3
@@ -61,7 +61,7 @@ def build_candidate_registry(
 def build_fetch_payload(
     candidates: Sequence[Mapping[str, Any]],
     *,
-    limit: int,
+    limit: Optional[int],
     min_duration: int,
     channels: Sequence[str],
     title_filters: Sequence[str] = (),
