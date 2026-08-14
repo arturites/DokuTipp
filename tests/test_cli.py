@@ -80,13 +80,40 @@ class CandidateIdTests(unittest.TestCase):
 
         self.assertEqual(candidate_id(missing_values), candidate_id(none_values))
 
-    def test_registry_rejects_candidates_with_an_ambiguous_hash_collision(self):
-        first = make_candidate("Collision documentary", description="First synopsis.")
-        second = dict(first, description="Different synopsis, same identity fields.")
+    def test_registry_collapses_repeated_rows_with_the_reported_candidate_id(self):
+        first = make_candidate(
+            "Charlotte Link – Der Beobachter",
+            channel="ARD",
+            date="13.08.2026",
+            duration="01:34:08",
+            description="First source synopsis.",
+            website=(
+                "https://www.ardmediathek.de/video/"
+                "Y3JpZDovL2FyZC5kZS9wbGFuQVJEXzhhNmIzNTY1LTJjM2QtNDgwZS1iODBk"
+                "LTliNThmZjczNWFjZV9nYW56ZVNlbmR1bmc"
+            ),
+        )
+        repeated = dict(first, description="Updated source synopsis.")
+        identifier = candidate_id(first)
 
-        self.assertEqual(candidate_id(first), candidate_id(second))
-        with self.assertRaisesRegex(SelectionError, "Ambiguous candidate ID"):
-            build_candidate_registry([first, second])
+        self.assertEqual(
+            identifier,
+            "80fda51bfcad1147552f49cd083d44e63d70ad2847ab3015c080b5c9cc7c3749",
+        )
+        self.assertEqual(identifier, candidate_id(repeated))
+
+        registry = build_candidate_registry([first, repeated])
+
+        self.assertEqual(list(registry), [identifier])
+        self.assertIs(registry[identifier], first)
+
+    def test_registry_rejects_a_true_hash_collision(self):
+        first = make_candidate("First identity")
+        second = make_candidate("Different identity")
+
+        with patch.object(selection, "candidate_id", return_value="a" * 64):
+            with self.assertRaisesRegex(SelectionError, "Ambiguous candidate ID"):
+                build_candidate_registry([first, second])
 
 
 class FetchPayloadTests(unittest.TestCase):
@@ -205,6 +232,25 @@ class FetchPayloadTests(unittest.TestCase):
                 for candidate in candidates:
                     self.assertNotIn(candidate["website"], output.getvalue())
 
+    def test_fetch_counts_repeated_source_rows_as_one_candidate(self):
+        candidates = [
+            self.candidates[0],
+            dict(self.candidates[0], description="Updated source synopsis."),
+            self.candidates[1],
+            self.candidates[2],
+        ]
+        output = io.StringIO()
+
+        with patch.object(cli, "load_candidates", return_value=candidates):
+            payload = cli.run_fetch(output=output, today=date(2026, 8, 12))
+
+        self.assertEqual(payload["status"], "insufficient_candidates")
+        self.assertEqual(
+            [candidate["id"] for candidate in payload["candidates"]],
+            [candidate_id(candidate) for candidate in self.candidates[:3]],
+        )
+        self.assertIn("3 von 4 benötigt", payload["message"])
+
 
 class SelectionArgumentTests(unittest.TestCase):
     def setUp(self):
@@ -319,6 +365,26 @@ class SelectionArgumentTests(unittest.TestCase):
 
         with self.assertRaisesRegex(SelectionError, "Unknown candidate ID"):
             resolve_selection(selection_argument, self.candidates)
+
+    def test_resolver_accepts_repeated_rows_for_one_logical_candidate(self):
+        candidates = [
+            self.candidates[0],
+            dict(self.candidates[0], description="Updated source synopsis."),
+            *self.candidates[1:],
+        ]
+        one, two, three, extra = self.identifiers
+
+        resolved = resolve_selection(
+            f"{one},{two},{three},x{extra}",
+            candidates,
+        )
+
+        self.assertEqual(
+            [candidate["title"] for candidate in resolved.recommendations],
+            ["One", "Two", "Three"],
+        )
+        self.assertIs(resolved.recommendations[0], self.candidates[0])
+        self.assertEqual(resolved.extra_recommendation["title"], "Extra")
 
 
 class RenderingTests(unittest.TestCase):

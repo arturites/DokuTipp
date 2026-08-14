@@ -30,10 +30,7 @@ class ResolvedSelection:
 
 def candidate_id(candidate: Mapping[str, Any]) -> str:
     """Return the stable full SHA-256 ID for one source candidate."""
-    identity = {
-        field: _text(candidate.get(field))
-        for field in CANDIDATE_HASH_FIELDS
-    }
+    identity = _candidate_identity(candidate)
     canonical_json = json.dumps(
         identity,
         ensure_ascii=False,
@@ -46,14 +43,18 @@ def candidate_id(candidate: Mapping[str, Any]) -> str:
 def build_candidate_registry(
     candidates: Sequence[Mapping[str, Any]],
 ) -> Dict[str, Mapping[str, Any]]:
-    """Map stable IDs to source records and reject ambiguous IDs."""
+    """Map logical candidates once and reject true hash collisions."""
     registry: Dict[str, Mapping[str, Any]] = {}
     for candidate in candidates:
         identifier = candidate_id(candidate)
         if identifier in registry:
-            raise SelectionError(
-                f"Ambiguous candidate ID {identifier!r} maps to multiple candidates."
-            )
+            if _candidate_identity(registry[identifier]) != _candidate_identity(
+                candidate
+            ):
+                raise SelectionError(
+                    f"Ambiguous candidate ID {identifier!r} maps to multiple candidates."
+                )
+            continue
         registry[identifier] = candidate
     return registry
 
@@ -82,9 +83,9 @@ def build_fetch_payload(
             }
         )
 
-    if not candidates:
+    if not registry:
         status = "no_candidates"
-    elif len(candidates) < TOTAL_RECOMMENDATION_COUNT:
+    elif len(registry) < TOTAL_RECOMMENDATION_COUNT:
         status = "insufficient_candidates"
     else:
         status = "ready"
@@ -182,3 +183,11 @@ def _text(value: Any) -> str:
     if value is None:
         return ""
     return str(value)
+
+
+def _candidate_identity(candidate: Mapping[str, Any]) -> Dict[str, str]:
+    """Return the normalized fields that define one logical candidate."""
+    return {
+        field: _text(candidate.get(field))
+        for field in CANDIDATE_HASH_FIELDS
+    }

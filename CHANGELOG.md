@@ -32,6 +32,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Require users of the removed source-checkout wrappers to migrate to
   `dokutipp fetch` and `dokutipp select`.
 
+### Fixed
+
+- Treat repeated MediathekView rows for the same logical candidate as one
+  selectable ID while continuing to reject true SHA-256 collisions.
+
 ### Removed
 
 - Remove the `scripts/start_curation.py` compatibility wrapper.

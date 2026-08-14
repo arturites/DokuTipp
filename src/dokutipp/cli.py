@@ -125,24 +125,21 @@ def run_fetch(
         filter_file=filter_file,
     )
     title_filters = load_title_filters(filter_file)
-    message = ""
-    if not candidates:
-        message = render_no_candidates(today=today)
-    elif len(candidates) < TOTAL_RECOMMENDATION_COUNT:
-        message = render_insufficient_candidates(
-            available=len(candidates),
-            required=TOTAL_RECOMMENDATION_COUNT,
-            today=today,
-        )
-
     payload = build_fetch_payload(
         candidates,
         limit=limit,
         min_duration=min_duration,
         channels=channels,
         title_filters=title_filters,
-        message=message,
     )
+    if payload["status"] == "no_candidates":
+        payload["message"] = render_no_candidates(today=today)
+    elif payload["status"] == "insufficient_candidates":
+        payload["message"] = render_insufficient_candidates(
+            available=len(payload["candidates"]),
+            required=TOTAL_RECOMMENDATION_COUNT,
+            today=today,
+        )
     json.dump(payload, output, ensure_ascii=False, indent=2)
     output.write("\n")
     return payload
