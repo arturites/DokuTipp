@@ -156,7 +156,7 @@ class FetchPayloadTests(unittest.TestCase):
                 "limit": 17,
                 "min_duration": 55,
                 "channels": ["ZDF", "ARTE.DE"],
-                "title_exclusions": ["Audiodeskription", "Mittagsmagazin"],
+                "title_exclusions": list(parser.load_title_filters()),
             },
         )
         self.assertEqual(
@@ -770,6 +770,61 @@ class CliIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual([entry["title"] for entry in results], ["ARD documentary"])
+
+    def test_default_title_filters_exclude_formats_but_preserve_documentaries(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filmliste = Path(temporary_directory) / cli.FILMLISTE_FILENAME
+            now = int(time.time())
+            entries = [
+                make_entry(
+                    "ZDF",
+                    "Volle Kanne vom 14. August 2026",
+                    "00:50:00",
+                    now,
+                ),
+                make_entry("ARTE.DE", "Wakefield (1/8)", "00:50:00", now),
+                make_entry(
+                    "ARD",
+                    "Leichtathletik-EM: Frühsession vom 13. August",
+                    "00:50:00",
+                    now,
+                ),
+                make_entry("ZDF", "Trailer: Neue Serie", "00:50:00", now),
+                make_entry(
+                    "ARTE.DE",
+                    "ARTE Reportage - Russland / Madagaskar",
+                    "00:50:00",
+                    now,
+                ),
+                make_entry(
+                    "ARTE.DE",
+                    "Stadt Land Kunst - Japan / El Salvador / Delphi",
+                    "00:50:00",
+                    now,
+                ),
+                make_entry(
+                    "ARTE.DE",
+                    "Studio 54 - Hinter den Pforten des legendären Clubs",
+                    "00:50:00",
+                    now,
+                ),
+            ]
+            write_filmliste(filmliste, entries)
+
+            results = parser.parse_filmliste(
+                filmliste,
+                min_duration=cli.DEFAULT_MIN_DURATION,
+                channels=parser.DEFAULT_CHANNELS,
+            )
+
+        self.assertEqual(
+            [entry["title"] for entry in results],
+            [
+                "ARTE Reportage - Russland / Madagaskar",
+                "Stadt Land Kunst - Japan / El Salvador / Delphi",
+                "Studio 54 - Hinter den Pforten des legendären Clubs",
+            ],
+        )
 
     def test_parser_uses_case_insensitive_title_regexes_from_filter_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

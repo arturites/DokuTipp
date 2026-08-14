@@ -1,3 +1,101 @@
 # Case-insensitive regular expressions matched against programme titles.
-Audiodeskription
+
+# News and weather editions
 Mittagsmagazin
+^tagesschau \d{1,2}:\d{2} Uhr
+^Tagesschau vom \d{2}\.\d{2}\.\d{4}(?::|$)
+^tagesschau in (?:100 Sekunden|Einfacher Sprache)\b
+^tagesthemen \d{1,2}:\d{2} Uhr
+^ZDF heute Sendung vom\b
+^heute Xpress\b
+^heute journal(?: update)? vom\b
+^Aktuelle Stunde \| \d{2}\.\d{2}\.\d{4}$
+^DER TAG in Berlin & Brandenburg vom \d{2}\.\d{2}\.\d{4}$
+^ORF III AKTUELL(?: vom \d{2}\.\d{2}\.\d{4}| Spezial:)
+^Wetter vor acht$
+^So wird das Wetter$
+
+# Magazines, talk shows, quiz shows, and entertainment
+^28 Minute[ns](?:\s+-|\s+\()
+^Guten Morgen Österreich vom \d{2}\.\d{2}\.\d{4}$
+^hallo deutschland vom\b
+^hallo hessen [–-] Teil [12] vom \d{2}\.\d{2}\.\d{4}$
+^Hier und heute \| \d{2}\.\d{2}\.\d{4}$
+^Landesschau Baden-Württemberg vom \d{1,2}\.\d{1,2}\.\d{4}$
+^maischberger am \d{2}\.\d{2}\.\d{4}
+^MDR um 4\b
+^Studio 2 vom \d{2}\.\d{2}\.\d{4}$
+^Volle Kanne vom\b
+^13 Fragen:
+Die Trödel-Show mit Horst Lichter
+^Bares für Rares(?: XXL)? (?:vom|-)
+- Lieblingsstücke vom \d{1,2}\.
+- Tagesmotto vom
+^Der Quiz-Champion\b
+^Smart10 - Das Quiz mit den zehn Möglichkeiten vom \d{2}\.\d{2}\.\d{4}$
+^Gefragt [–-] Gejagt vom \d{2}\.\d{2}\.\d{4}$
+^Wer weiß denn sowas\? \(\d+\)$
+Duell(?:\*| )der(?:\*| )Gartenprofis
+^Johann König findet:
+^Martin Frank [–-] Live auf der Bühne!$
+^Happy Hour Takeover mit
+^Karlsplatz [–-] Mit
+^Gernot Kulis: Kulisionen \(\d+/\d+\)$
+\bin kabarett\.com$
+
+# Fiction series and television films
+^Wakefield \(\d+/\d+\)
+^Occupied(?: \(\d+/\d+\)| - (?:Die Besatzung - Staffel|Saison|Stagione) \d+)
+^(?:Mord im Mittsommer - Staffel|Meurtres à Sandhamn - Saison) \d+
+^Sturm der Liebe \(\d+\)
+^Rote Rosen \(\d+\)
+^Soko Kitzbühel \(\d+/\d+\):
+^Der Winzerkönig \(\d+/\d+\):
+^Die Detektive \(\d+/\d+\):
+^Alles finster \(\d+/\d+\)$
+Fleming - Der Mann, der Bond wurde \(S\d{2}/E\d{2}\)
+Walking on Sunshine\s+\(S\d{2}/E\d{2}\)
+Grantchester \(S\d{2}/E\d{2}\)
+Joan \(S\d{2}/E\d{2}\)
+Tage, die es nicht gab(?::| \| Staffel)
+Vorstadtweiber \(S\d{2}/E\d{2}\)
+Arcadia \(S\d{2}/E\d{2}\)
+Surface [·-] Das versunkene Dorf
+^Rebecka Martinsson -
+^Merz gegen Merz -
+^Borchert (?:und|s)\b
+Der (?:Amsterdam|Barcelona|Kroatien|Usedom)-Krimi
+(?:Kommissar|Mankells) Wallander
+^Maria Wern, Kripo Gotland -
+[–-] Liebe am Fjord$
+[–-] Pfarrer Braun$
+[–-] Weingut Wader
+- Zimmer mit Stall$
+^Die Toten am Meer -
+- Hotel Heidelberg$
+^Mordkommission Istanbul \(\d+\)
+[–-] Ein Fall für Nadja \(S\d{2}/E\d{2}\)
+^Mord in bester Gesellschaft -
+- Fernsehfilm,
+
+# Sports broadcasts and concert recordings
+Leichtathletik[- ]EM.*(?:Session|Tag \d|Highlights)
+^Leichtathletik-EM und Schwimm-EM\b
+Schwimm-+EM.*(?:Vorl(?:auf|äufe)|Tag \d|Highlights|Mixed Staffel|High Diving|Schwimmen|Wasserspringen)
+\bRe-Live\b
+^Pferdesport FEI Weltmeisterschaft 20\d{2}(?:$|:)
+^Fußball WM 20\d{2} Gruppe [A-Z] - MD\d:
+^Conference League Quali: .+ - .+$
+^Rhythmische Sportgymnastik -
+^Die (?:Früh|Spät|späte Schwimm)-Session\b
+^Das Finale des Nationenpreis$
+- Nature One 20\d{2}
+- Aus der Oper im Steinbruch 20\d{2}$
+^Klassikstars am Traunsee 20\d{2}$
+^Der Ring aus Erl:
+
+# Alternate versions, trailers, and programme previews
+Audiodeskription
+\bTrailer\b
+^Teaser:
+\bProgrammvorschau\b
