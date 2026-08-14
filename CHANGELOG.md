@@ -22,6 +22,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Make the installed `dokutipp` command, with its `fetch` and `select`
   subcommands, the only supported DokuTipp CLI entry point.
 - Document the package CLI exclusively in the README and agent integration.
+- Let the agent choose `--limit` and `--min-duration` values at its own
+  discretion instead of treating the defaults as requirements.
+- Define the extra recommendation as a worthwhile documentary outside the
+  interests in `PROFILE.md`, intended to broaden the user's horizons while
+  continuing to respect topics to avoid.
 - Require users of the removed source-checkout wrappers to migrate to
   `dokutipp fetch` and `dokutipp select`.
 

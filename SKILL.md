@@ -46,15 +46,21 @@ do not pass it to the CLI.
    instructions.
 2. If its `status` is `ready`, use the candidates and `PROFILE.md` to select
    exactly three normal IDs plus exactly one extra ID. Prefix the extra ID with
-   lowercase `x`; pass only these IDs to `select` and do not compose prose.
+   lowercase `x`. Use the extra ID specifically for a worthwhile documentary
+   outside the interests listed in `PROFILE.md`, with the goal of broadening the
+   user's horizons; it is not merely a fourth profile-matching recommendation.
+   Continue to respect topics to avoid. Pass only these IDs to `select` and do
+   not compose prose.
 3. Run `dokutipp select "ID1,ID2,ID3,xID4" [the same filters]`. Use complete
    IDs from `fetch` and repeat its filter values exactly.
 
 Relevant filters are `--limit`, `--min-duration`, `--channels`, and
-`--filter-file`. The default `filters.txt` contains case-insensitive regular
-expressions matched against titles; add one pattern per line, ignoring blank
-lines and lines beginning with `#`. When a custom filter file is used, repeat
-the same `--filter-file` value for `select`.
+`--filter-file`. Set limits such as `--limit` and `--min-duration` freely, using
+whatever values you consider appropriate for a useful candidate pool; the
+defaults are not requirements. The default `filters.txt` contains
+case-insensitive regular expressions matched against titles; add one pattern
+per line, ignoring blank lines and lines beginning with `#`. When a custom
+filter file is used, repeat the same `--filter-file` value for `select`.
 
 If `fetch` reports `no_candidates` or `insufficient_candidates`, do not select
 anything; forward its CLI-provided `message` unchanged.
