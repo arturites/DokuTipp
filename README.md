@@ -142,7 +142,7 @@ The following options are available on both `fetch` and `select`:
 | --- | --- | --- |
 | `--limit N` | `1337` | Maximum number of filtered source candidates. |
 | `--min-duration MINUTES` | `42` | Exclude entries shorter than this duration. |
-| `--channels CHANNEL [CHANNEL ...]` | `ARD ZDF ARTE.DE` | Broadcasters to include. |
+| `--channels CHANNEL [CHANNEL ...]` | all channels | Broadcasters to include. |
 | `--filter-file PATH` | `filters.txt` | File with title-exclusion regular expressions. |
 
 The default `filters.txt` is stored in the repository root and is bundled for
@@ -152,9 +152,9 @@ matched only against programme titles. Add a new title pattern to this file,
 or pass another file with `--filter-file` to both `fetch` and `select`.
 
 The default filter uses a 24-hour cache at `data/Filmliste-akt.xz`, downloads
-the list when necessary, considers ARD, ZDF, and ARTE.DE entries from the past
+the list when necessary, considers entries from all broadcasters from the past
 seven days, and excludes future entries and titles matching the patterns listed
-in `filters.txt`.
+in `filters.txt`. Pass `--channels` to restrict the broadcaster selection.
 
 ## Skill integration
 

@@ -728,7 +728,7 @@ class CliIntegrationTests(unittest.TestCase):
 
         self.assertIn("## 🔭 Extra-Empfehlung", output.getvalue())
 
-    def test_parser_preserves_default_documentary_filters(self):
+    def test_parser_does_not_prefer_a_sender_by_default(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             filmliste = Path(temporary_directory) / cli.FILMLISTE_FILENAME
             now = int(time.time())
@@ -749,7 +749,27 @@ class CliIntegrationTests(unittest.TestCase):
                 channels=parser.DEFAULT_CHANNELS,
             )
 
-        self.assertEqual([entry["title"] for entry in results], ["Eligible documentary"])
+        self.assertEqual(
+            [entry["title"] for entry in results],
+            ["Eligible documentary", "Wrong channel"],
+        )
+
+    def test_parser_filters_senders_when_explicitly_requested(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filmliste = Path(temporary_directory) / cli.FILMLISTE_FILENAME
+            now = int(time.time())
+            entries = [
+                make_entry("ARD", "ARD documentary", "00:42:00", now),
+                make_entry("WDR", "WDR documentary", "00:42:00", now),
+            ]
+            write_filmliste(filmliste, entries)
+
+            results = parser.parse_filmliste(
+                filmliste,
+                channels=("ARD",),
+            )
+
+        self.assertEqual([entry["title"] for entry in results], ["ARD documentary"])
 
     def test_parser_uses_case_insensitive_title_regexes_from_filter_file(self):
         with tempfile.TemporaryDirectory() as temporary_directory:

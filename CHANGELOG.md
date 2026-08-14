@@ -15,6 +15,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- Do not prefer specific broadcasters by default; include entries from all
+  channels unless `--channels` is provided.
 - Move the hard-coded `Audiodeskription` title exclusion into `filters.txt`,
   where additional exclusions such as `Mittagsmagazin` can be maintained.
 - Make the installed `dokutipp` command, with its `fetch` and `select`

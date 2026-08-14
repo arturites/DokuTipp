@@ -197,7 +197,7 @@ def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         default=DEFAULT_CHANNELS,
         metavar="CHANNEL",
-        help="Channels to include (default: ARD ZDF ARTE.DE)",
+        help="Channels to include (default: all channels)",
     )
     parser.add_argument(
         "--filter-file",

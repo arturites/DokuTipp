@@ -21,7 +21,8 @@ IDX_WEBSITE = 9     # Mediathek page URL
 IDX_DATUM_L = 16    # Unix timestamp as string
 
 SEVEN_DAYS = 7 * 24 * 3600
-DEFAULT_CHANNELS: Tuple[str, ...] = ("ARD", "ZDF", "ARTE.DE")
+# An empty selection means that no broadcaster preference is applied.
+DEFAULT_CHANNELS: Tuple[str, ...] = ()
 FILTER_FILENAME = "filters.txt"
 
 
@@ -173,7 +174,7 @@ def parse_filmliste(
         last_sender = sender
         last_thema = thema
 
-        if sender not in allowed_channels:
+        if allowed_channels and sender not in allowed_channels:
             continue
 
         try:
@@ -244,7 +245,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         nargs="+",
         default=DEFAULT_CHANNELS,
         metavar="CHANNEL",
-        help="Channels to include (default: ARD ZDF ARTE.DE)",
+        help="Channels to include (default: all channels)",
     )
     parser.add_argument(
         "--filter-file",
