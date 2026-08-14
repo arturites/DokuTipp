@@ -1,0 +1,23 @@
+# Changelog
+
+All notable changes to DokuTipp are documented in this file.
+
+The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Changed
+
+- Make the installed `dokutipp` command, with its `fetch` and `select`
+  subcommands, the only supported DokuTipp CLI entry point.
+- Document the package CLI exclusively in the README and agent integration.
+- Require users of the removed source-checkout wrappers to migrate to
+  `dokutipp fetch` and `dokutipp select`.
+
+### Removed
+
+- Remove the `scripts/start_curation.py` compatibility wrapper.
+- Remove the `scripts/parse_filmliste.py` compatibility wrapper.
+
+[unreleased]: https://github.com/arturites/DokuTipp/compare/v1.3.0...HEAD

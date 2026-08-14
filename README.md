@@ -22,7 +22,22 @@ film-list data.
 
 DokuTipp requires Python 3.9 or newer and `curl` on `PATH`.
 
-### Recommended: install from a checkout in a virtual environment
+### Recommended: install the checkout with pipx
+
+Use pipx if `dokutipp` should be available from every terminal without manual
+environment activation:
+
+```bash
+pipx install https://github.com/arturites/DokuTipp.git
+```
+
+If you want to update to a newer version use:
+
+```bash
+pipx upgrade dokutipp
+```
+
+### Alternative: install from a checkout in a virtual environment
 
 The following steps work on macOS and Linux and keep DokuTipp's Python
 dependencies separate from the rest of the system:
@@ -53,33 +68,6 @@ dokutipp --help
 ```
 
 Use `deactivate` to leave the virtual environment.
-
-### Alternative: install the checkout with pipx
-
-Use pipx if `dokutipp` should be available from every terminal without manual
-environment activation:
-
-```bash
-git clone https://github.com/arturites/DokuTipp.git
-cd DokuTipp
-
-python3 -m pip install --user pipx
-python3 -m pipx ensurepath
-# Open a new terminal so the PATH change takes effect.
-
-pipx install .
-dokutipp --help
-```
-
-### If `dokutipp` is not found
-
-For the virtual-environment installation, make sure that
-`source .venv/bin/activate` has run in the current terminal. For pipx, open a
-new terminal after `python3 -m pipx ensurepath`, then check the command with:
-
-```bash
-command -v dokutipp
-```
 
 ## Fetch and select
 
@@ -157,22 +145,6 @@ The default filter uses a 24-hour cache at `data/Filmliste-akt.xz`, downloads
 the list when necessary, considers ARD, ZDF, and ARTE.DE entries from the past
 seven days, and excludes future entries and titles containing
 `Audiodeskription`.
-
-### Source checkout wrapper
-
-The source checkout retains the former wrapper as a compatibility entry point
-for `fetch`:
-
-```bash
-python3 scripts/start_curation.py
-python3 scripts/start_curation.py --limit 50 --min-duration 60 --channels ARD ZDF
-```
-
-Use the installed `dokutipp select` command to submit the chosen IDs. The
-wrapper intentionally covers candidate fetching only.
-
-`scripts/parse_filmliste.py` remains a low-level compatibility tool for
-filtered JSON; it is not the primary end-user interface.
 
 ## Skill integration
 

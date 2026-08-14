@@ -50,9 +50,7 @@ do not pass it to the CLI.
 3. Run `dokutipp select "ID1,ID2,ID3,xID4" [the same filters]`. Use complete
    IDs from `fetch` and repeat its filter values exactly.
 
-Relevant filters are `--limit`, `--min-duration`, and `--channels`. In a source
-checkout, `python3 scripts/start_curation.py [filters]` is the compatibility
-entry point for `fetch`; submit the selection with `dokutipp select`.
+Relevant filters are `--limit`, `--min-duration`, and `--channels`.
 
 If `fetch` reports `no_candidates` or `insufficient_candidates`, do not select
 anything; forward its CLI-provided `message` unchanged.

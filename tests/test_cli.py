@@ -2,7 +2,6 @@ import io
 import json
 import lzma
 import os
-import runpy
 import sys
 import tempfile
 import time
@@ -695,27 +694,6 @@ class CliIntegrationTests(unittest.TestCase):
             )
 
         self.assertEqual([entry["title"] for entry in results], ["Eligible documentary"])
-
-    def test_legacy_start_script_delegates_to_cli_main(self):
-        with patch.object(cli, "main") as main:
-            with patch.object(sys, "argv", ["start_curation.py", "--limit", "8"]):
-                runpy.run_path(
-                    str(REPOSITORY_ROOT / "scripts" / "start_curation.py"),
-                    run_name="__main__",
-                )
-
-        main.assert_called_once_with(
-            ["fetch", "--limit", "8"], data_dir=REPOSITORY_ROOT / "data"
-        )
-
-    def test_legacy_parser_script_reexports_parser_helpers(self):
-        namespace = runpy.run_path(
-            str(REPOSITORY_ROOT / "scripts" / "parse_filmliste.py")
-        )
-
-        self.assertIs(namespace["parse_raw"], parser.parse_raw)
-        self.assertIs(namespace["parse_filmliste"], parser.parse_filmliste)
-
 
 def make_candidate(
     title,
