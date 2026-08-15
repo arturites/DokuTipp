@@ -149,6 +149,16 @@ description. The Mediathek URL is deliberately not part of the `fetch` payload;
 DokuTipp resolves it from the original data during `select`. IDs are full
 SHA-256 hashes of the candidate's title, duration, broadcaster, date, and URL.
 
+After each successful `select`, DokuTipp stores all four selected hashes,
+including the extra recommendation, with their timestamps in the local
+`data/recommendation-history.json`. Subsequent `fetch` calls omit exact hash
+matches for seven days (7 x 24 hours). Expired entries are removed on the next
+history access, so those candidates can be recommended again without a manual
+reset. A damaged local history is reset automatically with a warning on stderr.
+The history contains only hashes and timestamps. If any identity field used by
+the hash changes, the source record receives a different ID and is not
+suppressed by the earlier history entry.
+
 ### Submit a selection
 
 Pass exactly four complete candidate IDs from the preceding `fetch` result as

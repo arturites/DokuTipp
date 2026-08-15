@@ -18,6 +18,11 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Add a transparent, versioned `filters.txt` title-exclusion list with
   case-insensitive regular-expression support and a `--filter-file` override.
 - Include the active title-exclusion patterns in the `fetch` filter metadata.
+- Add a local seven-day recommendation history at
+  `data/recommendation-history.json`. Successful `select` runs store all four
+  selected SHA-256 hashes, including the extra recommendation, with timestamps
+  only; `fetch` omits exact matches for 7 x 24 hours and removes expired entries
+  automatically.
 
 ### Changed
 

@@ -6,7 +6,7 @@ import hashlib
 import json
 import re
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import AbstractSet, Any, Dict, Mapping, Optional, Sequence, Tuple
 
 
 NORMAL_RECOMMENDATION_COUNT = 3
@@ -66,12 +66,19 @@ def build_fetch_payload(
     min_duration: int,
     channels: Sequence[str],
     title_filters: Sequence[str] = (),
+    excluded_ids: AbstractSet[str] = frozenset(),
     message: str = "",
 ) -> Dict[str, Any]:
-    """Build the machine-readable candidate payload emitted by fetch."""
+    """Build the machine-readable candidate payload emitted by fetch.
+
+    Candidate IDs are excluded only after the registry has checked the complete
+    source set for duplicate rows and genuine hash collisions.
+    """
     registry = build_candidate_registry(candidates)
     candidate_payload = []
     for identifier, candidate in registry.items():
+        if identifier in excluded_ids:
+            continue
         candidate_payload.append(
             {
                 "id": identifier,
@@ -83,9 +90,10 @@ def build_fetch_payload(
             }
         )
 
-    if not registry:
+    available = len(candidate_payload)
+    if not available:
         status = "no_candidates"
-    elif len(registry) < TOTAL_RECOMMENDATION_COUNT:
+    elif available < TOTAL_RECOMMENDATION_COUNT:
         status = "insufficient_candidates"
     else:
         status = "ready"

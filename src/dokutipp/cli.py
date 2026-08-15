@@ -11,6 +11,11 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, TextIO
 
+from .history import (
+    RecommendationHistoryError,
+    load_recent_ids,
+    record_selected_ids,
+)
 from .onboarding import OnboardingError, ensure_installation, run_setup
 from .parser import (
     DEFAULT_CHANNELS,
@@ -27,11 +32,13 @@ from .selection import (
     SelectionError,
     TOTAL_RECOMMENDATION_COUNT,
     build_fetch_payload,
+    parse_selection_argument,
     resolve_selection,
 )
 
 
 FILMLISTE_FILENAME = "Filmliste-akt.xz"
+HISTORY_FILENAME = "recommendation-history.json"
 DOWNLOAD_URL = "https://liste.mediathekview.de/Filmliste-akt.xz"
 MAX_AGE_SECONDS = 24 * 3600
 DEFAULT_LIMIT: Optional[int] = None
@@ -55,6 +62,17 @@ def default_data_dir() -> Path:
     ).is_dir():
         return checkout_root / "data"
     return Path.cwd() / "data"
+
+
+def default_history_file(data_dir: Optional[Path] = None) -> Path:
+    """Return the local recommendation-history file for the active data cache."""
+    if data_dir is None:
+        data_dir = default_data_dir()
+    return data_dir / HISTORY_FILENAME
+
+
+def _history_warning(message: str) -> None:
+    print(f"Warning: {message}", file=sys.stderr)
 
 
 def needs_download(filmliste: Path) -> bool:
@@ -111,6 +129,8 @@ def run_fetch(
     filter_file: Optional[Path] = None,
     output: Optional[TextIO] = None,
     today: Optional[date] = None,
+    history_file: Optional[Path] = None,
+    history_now: Optional[float] = None,
 ) -> Dict[str, Any]:
     """Write the structured candidate set for agent-side ID selection."""
     if output is None:
@@ -126,12 +146,18 @@ def run_fetch(
         filter_file=filter_file,
     )
     title_filters = load_title_filters(filter_file)
+    recent_ids = load_recent_ids(
+        default_history_file(data_dir) if history_file is None else history_file,
+        now=history_now,
+        warn=_history_warning,
+    )
     payload = build_fetch_payload(
         candidates,
         limit=limit,
         min_duration=min_duration,
         channels=channels,
         title_filters=title_filters,
+        excluded_ids=recent_ids,
     )
     if payload["status"] == "no_candidates":
         payload["message"] = render_no_candidates(today=today)
@@ -156,6 +182,8 @@ def run_select(
     filter_file: Optional[Path] = None,
     output: Optional[TextIO] = None,
     today: Optional[date] = None,
+    history_file: Optional[Path] = None,
+    history_now: Optional[float] = None,
 ) -> None:
     """Resolve an agent selection and write the complete final Markdown."""
     if output is None:
@@ -171,7 +199,17 @@ def run_select(
         filter_file=filter_file,
     )
     selection = resolve_selection(selection_argument, candidates)
-    output.write(render_recommendations(selection, today=today))
+    rendered = render_recommendations(selection, today=today)
+    recommendation_ids, extra_recommendation_id = parse_selection_argument(
+        selection_argument
+    )
+    record_selected_ids(
+        default_history_file(data_dir) if history_file is None else history_file,
+        [*recommendation_ids, extra_recommendation_id],
+        now=history_now,
+        warn=_history_warning,
+    )
+    output.write(rendered)
 
 
 def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
@@ -216,7 +254,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     fetch_parser = subparsers.add_parser(
         "fetch",
-        help="Output filtered candidates with stable IDs as JSON.",
+        help="Output filtered, not-recently-recommended candidates as JSON.",
     )
     add_filter_arguments(fetch_parser)
 
@@ -251,6 +289,8 @@ def main(
     canonical_skill_file: Optional[Path] = None,
     environment: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
+    history_file: Optional[Path] = None,
+    history_now: Optional[float] = None,
 ) -> None:
     parser = build_argument_parser()
     arguments = list(sys.argv[1:] if argv is None else argv)
@@ -293,6 +333,8 @@ def main(
                 min_duration=args.min_duration,
                 channels=args.channels,
                 filter_file=args.filter_file,
+                history_file=history_file,
+                history_now=history_now,
             )
         elif args.command == "select":
             run_select(
@@ -302,6 +344,8 @@ def main(
                 min_duration=args.min_duration,
                 channels=args.channels,
                 filter_file=args.filter_file,
+                history_file=history_file,
+                history_now=history_now,
             )
         elif args.command == "setup":
             # The exact `dokutipp setup` form was handled before preflight so it
@@ -311,7 +355,7 @@ def main(
         else:
             parser.print_help(file=sys.stderr)
             raise SystemExit(2)
-    except (FilterConfigError, SelectionError) as error:
+    except (FilterConfigError, RecommendationHistoryError, SelectionError) as error:
         print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(2)
 

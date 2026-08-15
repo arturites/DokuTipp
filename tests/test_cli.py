@@ -17,7 +17,7 @@ SOURCE_ROOT = REPOSITORY_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from dokutipp import cli, onboarding, parser, selection
+from dokutipp import cli, history, onboarding, parser, selection
 from dokutipp.parser import FilterConfigError
 from dokutipp.rendering import format_duration, render_recommendations
 from dokutipp.selection import (
@@ -122,9 +122,198 @@ class CandidateIdTests(unittest.TestCase):
             with self.assertRaisesRegex(SelectionError, "Ambiguous candidate ID"):
                 build_candidate_registry([first, second])
 
+            with self.assertRaisesRegex(SelectionError, "Ambiguous candidate ID"):
+                selection.build_fetch_payload(
+                    [first, second],
+                    limit=None,
+                    min_duration=42,
+                    channels=(),
+                    excluded_ids={"a" * 64},
+                )
+
+
+class RecommendationHistoryTests(unittest.TestCase):
+    def setUp(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.history_file = Path(temporary_directory.name) / "recommendation-history.json"
+        self.selected_at = 1_800_000_000.0
+        self.identifiers = [character * 64 for character in "abc"]
+
+    def test_missing_history_is_empty_without_creating_a_file(self):
+        self.assertEqual(
+            set(history.load_recent_ids(self.history_file, now=self.selected_at)),
+            set(),
+        )
+        self.assertFalse(self.history_file.exists())
+
+    def test_records_merges_refreshes_and_prunes_ids_at_the_exact_ttl(self):
+        first, refreshed, added = self.identifiers
+        history.record_selected_ids(
+            self.history_file,
+            [first, refreshed],
+            now=self.selected_at,
+        )
+        history.record_selected_ids(
+            self.history_file,
+            [refreshed, added],
+            now=self.selected_at + 60,
+        )
+
+        self.assertEqual(
+            set(
+                history.load_recent_ids(
+                    self.history_file,
+                    now=self.selected_at + history.HISTORY_TTL_SECONDS - 1,
+                )
+            ),
+            {first, refreshed, added},
+        )
+
+        self.assertEqual(
+            set(
+                history.load_recent_ids(
+                    self.history_file,
+                    now=self.selected_at + history.HISTORY_TTL_SECONDS,
+                )
+            ),
+            {refreshed, added},
+        )
+        persisted_history = (
+            self.history_file.read_text(encoding="utf-8")
+            if self.history_file.exists()
+            else ""
+        )
+        self.assertNotIn(first, persisted_history)
+
+        self.assertEqual(
+            set(
+                history.load_recent_ids(
+                    self.history_file,
+                    now=self.selected_at + 60 + history.HISTORY_TTL_SECONDS,
+                )
+            ),
+            set(),
+        )
+
+    def test_corrupted_history_is_reset_and_can_be_used_again(self):
+        self.history_file.write_text("{not valid json", encoding="utf-8")
+        warnings = []
+
+        self.assertEqual(
+            set(
+                history.load_recent_ids(
+                    self.history_file,
+                    now=self.selected_at,
+                    warn=warnings.append,
+                )
+            ),
+            set(),
+        )
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("invalid and has been reset", warnings[0])
+        self.assertEqual(
+            set(
+                history.load_recent_ids(
+                    self.history_file,
+                    now=self.selected_at,
+                    warn=warnings.append,
+                )
+            ),
+            set(),
+        )
+        self.assertEqual(len(warnings), 1)
+
+        identifier = self.identifiers[0]
+        history.record_selected_ids(
+            self.history_file,
+            [identifier],
+            now=self.selected_at,
+        )
+        self.assertEqual(
+            set(history.load_recent_ids(self.history_file, now=self.selected_at)),
+            {identifier},
+        )
+
+    def test_invalid_version_and_future_timestamp_are_not_kept_active(self):
+        identifier = self.identifiers[0]
+        self.history_file.write_text(
+            json.dumps({"version": True, "selected_at": {}}),
+            encoding="utf-8",
+        )
+        warnings = []
+
+        self.assertEqual(
+            history.load_recent_ids(
+                self.history_file,
+                now=self.selected_at,
+                warn=warnings.append,
+            ),
+            set(),
+        )
+        self.assertEqual(len(warnings), 1)
+
+        self.history_file.write_text(
+            json.dumps(
+                {
+                    "version": history.HISTORY_VERSION,
+                    "selected_at": {
+                        identifier: self.selected_at + history.HISTORY_TTL_SECONDS * 10
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        self.assertEqual(
+            history.load_recent_ids(self.history_file, now=self.selected_at),
+            set(),
+        )
+        self.assertNotIn(identifier, self.history_file.read_text(encoding="utf-8"))
+
+    def test_dangling_history_symlink_is_reset_instead_of_being_ignored(self):
+        self.history_file.symlink_to(self.history_file.parent / "missing-history.json")
+        warnings = []
+
+        self.assertEqual(
+            history.load_recent_ids(
+                self.history_file,
+                now=self.selected_at,
+                warn=warnings.append,
+            ),
+            set(),
+        )
+        self.assertFalse(self.history_file.is_symlink())
+        self.assertEqual(len(warnings), 1)
+
+    def test_failed_atomic_replace_preserves_the_previous_history(self):
+        first, second, _ = self.identifiers
+        history.record_selected_ids(
+            self.history_file,
+            [first],
+            now=self.selected_at,
+        )
+        previous_contents = self.history_file.read_bytes()
+
+        with patch.object(history.os, "replace", side_effect=OSError("disk full")):
+            with self.assertRaisesRegex(
+                history.RecommendationHistoryError,
+                "Could not write recommendation history",
+            ):
+                history.record_selected_ids(
+                    self.history_file,
+                    [second],
+                    now=self.selected_at + 60,
+                )
+
+        self.assertEqual(self.history_file.read_bytes(), previous_contents)
+
 
 class FetchPayloadTests(unittest.TestCase):
     def setUp(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.history_file = Path(temporary_directory.name) / "recommendation-history.json"
         self.candidates = [
             make_candidate(
                 "One",
@@ -162,6 +351,7 @@ class FetchPayloadTests(unittest.TestCase):
                 min_duration=55,
                 channels=("ZDF", "ARTE.DE"),
                 filter_file=None,
+                history_file=self.history_file,
                 output=output,
                 today=date(2026, 8, 12),
             )
@@ -208,7 +398,11 @@ class FetchPayloadTests(unittest.TestCase):
 
         output = io.StringIO()
         with patch.object(cli, "load_candidates", return_value=self.candidates) as load:
-            cli.run_fetch(output=output, today=date(2026, 8, 12))
+            cli.run_fetch(
+                history_file=self.history_file,
+                output=output,
+                today=date(2026, 8, 12),
+            )
 
         self.assertIsNone(load.call_args.kwargs["limit"])
         self.assertIsNone(json.loads(output.getvalue())["filters"]["limit"])
@@ -228,6 +422,7 @@ class FetchPayloadTests(unittest.TestCase):
                 output = io.StringIO()
                 with patch.object(cli, "load_candidates", return_value=candidates):
                     payload = cli.run_fetch(
+                        history_file=self.history_file,
                         output=output,
                         today=date(2026, 8, 12),
                     )
@@ -249,7 +444,11 @@ class FetchPayloadTests(unittest.TestCase):
         output = io.StringIO()
 
         with patch.object(cli, "load_candidates", return_value=candidates):
-            payload = cli.run_fetch(output=output, today=date(2026, 8, 12))
+            payload = cli.run_fetch(
+                history_file=self.history_file,
+                output=output,
+                today=date(2026, 8, 12),
+            )
 
         self.assertEqual(payload["status"], "insufficient_candidates")
         self.assertEqual(
@@ -257,6 +456,123 @@ class FetchPayloadTests(unittest.TestCase):
             [candidate_id(candidate) for candidate in self.candidates[:3]],
         )
         self.assertIn("3 von 4 benötigt", payload["message"])
+
+    def test_fetch_excludes_recent_ids_and_recomputes_status_until_exact_expiry(self):
+        selected_at = 1_800_000_000.0
+        candidates = [
+            *self.candidates,
+            make_candidate("Five", website="https://example.invalid/five"),
+        ]
+        identifiers = [candidate_id(candidate) for candidate in candidates]
+        history.record_selected_ids(
+            self.history_file,
+            identifiers[:2],
+            now=selected_at,
+        )
+
+        before_expiry = io.StringIO()
+        with patch.object(cli, "load_candidates", return_value=candidates):
+            active_payload = cli.run_fetch(
+                history_file=self.history_file,
+                history_now=selected_at + history.HISTORY_TTL_SECONDS - 1,
+                output=before_expiry,
+                today=date(2026, 8, 12),
+            )
+
+        self.assertEqual(active_payload["status"], "insufficient_candidates")
+        self.assertEqual(
+            [candidate["id"] for candidate in active_payload["candidates"]],
+            identifiers[2:],
+        )
+        self.assertIn("3 von 4 benötigt", active_payload["message"])
+        self.assertEqual(json.loads(before_expiry.getvalue()), active_payload)
+        self.assertNotIn(identifiers[0], before_expiry.getvalue())
+        self.assertNotIn(identifiers[1], before_expiry.getvalue())
+
+        at_expiry = io.StringIO()
+        with patch.object(cli, "load_candidates", return_value=candidates):
+            expired_payload = cli.run_fetch(
+                history_file=self.history_file,
+                history_now=selected_at + history.HISTORY_TTL_SECONDS,
+                output=at_expiry,
+                today=date(2026, 8, 12),
+            )
+
+        self.assertEqual(expired_payload["status"], "ready")
+        self.assertEqual(
+            [candidate["id"] for candidate in expired_payload["candidates"]],
+            identifiers,
+        )
+
+    def test_fetch_reports_no_candidates_when_every_candidate_is_recent(self):
+        selected_at = 1_800_000_000.0
+        identifiers = [candidate_id(candidate) for candidate in self.candidates]
+        history.record_selected_ids(
+            self.history_file,
+            identifiers,
+            now=selected_at,
+        )
+        output = io.StringIO()
+
+        with patch.object(cli, "load_candidates", return_value=self.candidates):
+            payload = cli.run_fetch(
+                history_file=self.history_file,
+                history_now=selected_at,
+                output=output,
+                today=date(2026, 8, 12),
+            )
+
+        self.assertEqual(payload["status"], "no_candidates")
+        self.assertEqual(payload["candidates"], [])
+        self.assertIn("Keine passenden Dokumentationen", payload["message"])
+
+    def test_recent_ids_do_not_refill_an_explicit_upstream_limit(self):
+        selected_at = 1_800_000_000.0
+        candidates = [
+            *self.candidates,
+            make_candidate("Five", website="https://example.invalid/five"),
+        ]
+        identifiers = [candidate_id(candidate) for candidate in candidates]
+        history.record_selected_ids(
+            self.history_file,
+            [identifiers[0]],
+            now=selected_at,
+        )
+        output = io.StringIO()
+
+        with patch.object(cli, "load_candidates", return_value=candidates[:4]) as load:
+            payload = cli.run_fetch(
+                limit=4,
+                history_file=self.history_file,
+                history_now=selected_at,
+                output=output,
+                today=date(2026, 8, 12),
+            )
+
+        self.assertEqual(payload["status"], "insufficient_candidates")
+        self.assertEqual(
+            [candidate["id"] for candidate in payload["candidates"]], identifiers[1:4]
+        )
+        self.assertNotIn(identifiers[4], output.getvalue())
+        self.assertEqual(load.call_args.kwargs["limit"], 4)
+
+    def test_corrupted_history_warns_without_contaminating_fetch_json(self):
+        self.history_file.write_text("{not valid json", encoding="utf-8")
+        output = io.StringIO()
+        stderr = io.StringIO()
+
+        with patch.object(cli, "load_candidates", return_value=self.candidates), redirect_stderr(
+            stderr
+        ):
+            payload = cli.run_fetch(
+                history_file=self.history_file,
+                history_now=1_800_000_000.0,
+                output=output,
+                today=date(2026, 8, 12),
+            )
+
+        self.assertEqual(json.loads(output.getvalue()), payload)
+        self.assertIn("Warning: Recommendation history", stderr.getvalue())
 
 
 class SelectionArgumentTests(unittest.TestCase):
@@ -572,6 +888,9 @@ class CacheTests(unittest.TestCase):
 
 class CliIntegrationTests(unittest.TestCase):
     def setUp(self):
+        temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary_directory.cleanup)
+        self.history_file = Path(temporary_directory.name) / "recommendation-history.json"
         self.candidates = [
             make_candidate("One", website="https://example.invalid/one"),
             make_candidate("Two", website="https://example.invalid/two"),
@@ -616,6 +935,112 @@ class CliIntegrationTests(unittest.TestCase):
             channels=("ZDF", "ARTE.DE"),
             filter_file=filter_file,
         )
+
+    def test_successful_select_records_all_four_ids_including_the_extra(self):
+        selected_at = 1_800_000_000.0
+        identifiers = [candidate_id(candidate) for candidate in self.candidates]
+        selection_argument = (
+            f"{identifiers[2]},x{identifiers[3]},"
+            f"{identifiers[0]},{identifiers[1]}"
+        )
+        output = io.StringIO()
+
+        with patch.object(cli, "load_candidates", return_value=self.candidates):
+            cli.run_select(
+                selection_argument,
+                history_file=self.history_file,
+                history_now=selected_at,
+                output=output,
+                today=date(2026, 8, 12),
+            )
+
+        self.assertTrue(output.getvalue().startswith("# 📺 DokuTipps der Woche"))
+        self.assertEqual(
+            set(history.load_recent_ids(self.history_file, now=selected_at)),
+            set(identifiers),
+        )
+
+    def test_invalid_select_does_not_create_or_mutate_history(self):
+        selected_at = 1_800_000_000.0
+        existing_identifier = "f" * 64
+        history.record_selected_ids(
+            self.history_file,
+            [existing_identifier],
+            now=selected_at,
+        )
+        history_before = self.history_file.read_bytes()
+
+        with patch.object(cli, "load_candidates", return_value=self.candidates):
+            with self.assertRaisesRegex(SelectionError, "exactly four"):
+                cli.run_select(
+                    "not-a-valid-selection",
+                    history_file=self.history_file,
+                    history_now=selected_at + 60,
+                    output=io.StringIO(),
+                )
+
+        self.assertEqual(self.history_file.read_bytes(), history_before)
+
+    def test_select_history_write_failure_emits_no_output_and_preserves_history(self):
+        identifiers = [candidate_id(candidate) for candidate in self.candidates]
+        selection_argument = (
+            f"{identifiers[0]},{identifiers[1]},{identifiers[2]},"
+            f"x{identifiers[3]}"
+        )
+        existing_identifier = "f" * 64
+        history.record_selected_ids(
+            self.history_file,
+            [existing_identifier],
+            now=1_800_000_000.0,
+        )
+        history_before = self.history_file.read_bytes()
+        output = io.StringIO()
+
+        with patch.object(cli, "load_candidates", return_value=self.candidates), patch.object(
+            cli,
+            "record_selected_ids",
+            side_effect=history.RecommendationHistoryError("history write failed"),
+        ):
+            with self.assertRaisesRegex(
+                history.RecommendationHistoryError,
+                "history write failed",
+            ):
+                cli.run_select(
+                    selection_argument,
+                    history_file=self.history_file,
+                    history_now=1_800_000_060.0,
+                    output=output,
+                )
+
+        self.assertEqual(output.getvalue(), "")
+        self.assertEqual(self.history_file.read_bytes(), history_before)
+
+    def test_cli_reports_a_history_write_failure_without_result_stdout(self):
+        identifiers = [candidate_id(candidate) for candidate in self.candidates]
+        selection_argument = (
+            f"{identifiers[0]},{identifiers[1]},{identifiers[2]},"
+            f"x{identifiers[3]}"
+        )
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with patch.object(cli, "ensure_installation", return_value=False), patch.object(
+            cli, "load_candidates", return_value=self.candidates
+        ), patch.object(
+            cli,
+            "record_selected_ids",
+            side_effect=history.RecommendationHistoryError("history write failed"),
+        ), redirect_stdout(stdout), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as error:
+                cli.main(
+                    ["select", selection_argument],
+                    history_file=self.history_file,
+                    history_now=1_800_000_000.0,
+                )
+
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("Error: history write failed", stderr.getvalue())
 
     def test_fetch_then_select_end_to_end_uses_stdout_for_results_and_stderr_for_logs(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -684,6 +1109,8 @@ class CliIntegrationTests(unittest.TestCase):
                         str(filter_file),
                     ],
                     data_dir=data_dir,
+                    history_file=self.history_file,
+                    history_now=1_800_000_000.0,
                 )
 
             fetch_payload = json.loads(fetch_stdout.getvalue())
@@ -718,7 +1145,36 @@ class CliIntegrationTests(unittest.TestCase):
                         str(filter_file),
                     ],
                     data_dir=data_dir,
+                    history_file=self.history_file,
+                    history_now=1_800_000_000.0,
                 )
+
+            repeated_fetch_stdout = io.StringIO()
+            repeated_fetch_stderr = io.StringIO()
+            with patch.object(
+                cli, "ensure_installation", return_value=False
+            ), redirect_stdout(repeated_fetch_stdout), redirect_stderr(
+                repeated_fetch_stderr
+            ):
+                cli.main(
+                    [
+                        "fetch",
+                        "--limit",
+                        "4",
+                        "--min-duration",
+                        "42",
+                        "--channels",
+                        "ARD",
+                        "ZDF",
+                        "ARTE.DE",
+                        "--filter-file",
+                        str(filter_file),
+                    ],
+                    data_dir=data_dir,
+                    history_file=self.history_file,
+                    history_now=1_800_000_000.0,
+                )
+            repeated_fetch_payload = json.loads(repeated_fetch_stdout.getvalue())
 
         self.assertEqual(fetch_payload["status"], "ready")
         self.assertNotIn("https://example.invalid/one", fetch_stdout.getvalue())
@@ -743,6 +1199,8 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertIn(
             "[Zur Mediathek](https://example.invalid/extra)", select_stdout.getvalue()
         )
+        self.assertEqual(repeated_fetch_payload["status"], "no_candidates")
+        self.assertEqual(repeated_fetch_payload["candidates"], [])
 
     def test_select_validation_failure_writes_only_a_stderr_error(self):
         stdout = io.StringIO()
@@ -752,7 +1210,10 @@ class CliIntegrationTests(unittest.TestCase):
         ):
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 with self.assertRaises(SystemExit) as error:
-                    cli.main(["select", "not-a-valid-selection"])
+                    cli.main(
+                        ["select", "not-a-valid-selection"],
+                        history_file=self.history_file,
+                    )
 
         self.assertEqual(error.exception.code, 2)
         self.assertEqual(stdout.getvalue(), "")
@@ -771,7 +1232,8 @@ class CliIntegrationTests(unittest.TestCase):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     with self.assertRaises(SystemExit) as error:
                         cli.main(
-                            ["fetch", "--filter-file", str(filter_file)]
+                            ["fetch", "--filter-file", str(filter_file)],
+                            history_file=self.history_file,
                         )
 
         self.assertEqual(error.exception.code, 2)
@@ -790,6 +1252,7 @@ class CliIntegrationTests(unittest.TestCase):
             with patch.object(cli, "load_candidates", return_value=self.candidates):
                 payload = cli.run_fetch(
                     filter_file=filter_file,
+                    history_file=self.history_file,
                     output=output,
                 )
 
@@ -802,6 +1265,12 @@ class CliIntegrationTests(unittest.TestCase):
             f"x{identifiers[3]}"
         )
         output = io.StringIO()
+        original_read_text = Path.read_text
+
+        def read_text_except_skill(path, *args, **kwargs):
+            if path.name == "SKILL.md":
+                raise AssertionError("SKILL.md must not be read")
+            return original_read_text(path, *args, **kwargs)
 
         with tempfile.TemporaryDirectory() as temporary_directory:
             original_cwd = Path.cwd()
@@ -811,10 +1280,12 @@ class CliIntegrationTests(unittest.TestCase):
                     with patch.object(
                         Path,
                         "read_text",
-                        side_effect=AssertionError("SKILL.md must not be read"),
+                        autospec=True,
+                        side_effect=read_text_except_skill,
                     ):
                         cli.run_select(
                             selection_argument,
+                            history_file=self.history_file,
                             output=output,
                             today=date(2026, 8, 12),
                         )
@@ -1320,6 +1791,7 @@ class OnboardingTests(unittest.TestCase):
                     ["fetch"],
                     config_file=config_file,
                     input_stream=io.StringIO(),
+                    history_file=root / "recommendation-history.json",
                 )
 
         self.assertEqual(json.loads(stdout.getvalue())["status"], "ready")
