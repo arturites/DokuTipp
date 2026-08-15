@@ -17,7 +17,7 @@ SOURCE_ROOT = REPOSITORY_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from dokutipp import cli, parser, selection
+from dokutipp import cli, onboarding, parser, selection
 from dokutipp.parser import FilterConfigError
 from dokutipp.rendering import format_duration, render_recommendations
 from dokutipp.selection import (
@@ -29,6 +29,13 @@ from dokutipp.selection import (
     parse_selection_argument,
     resolve_selection,
 )
+
+
+class InteractiveInput(io.StringIO):
+    """An in-memory terminal stream for onboarding tests."""
+
+    def isatty(self):
+        return True
 
 
 class CandidateIdTests(unittest.TestCase):
@@ -572,11 +579,13 @@ class CliIntegrationTests(unittest.TestCase):
             make_candidate("Extra", website="https://example.invalid/extra"),
         ]
 
-    def test_bare_cli_prints_help_to_stderr_and_exits_with_status_two(self):
+    def test_configured_bare_cli_prints_help_to_stderr_and_exits_with_status_two(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
 
-        with redirect_stdout(stdout), redirect_stderr(stderr):
+        with patch.object(cli, "ensure_installation", return_value=False), redirect_stdout(
+            stdout
+        ), redirect_stderr(stderr):
             with self.assertRaises(SystemExit) as error:
                 cli.main([])
 
@@ -657,7 +666,9 @@ class CliIntegrationTests(unittest.TestCase):
 
             fetch_stdout = io.StringIO()
             fetch_stderr = io.StringIO()
-            with redirect_stdout(fetch_stdout), redirect_stderr(fetch_stderr):
+            with patch.object(
+                cli, "ensure_installation", return_value=False
+            ), redirect_stdout(fetch_stdout), redirect_stderr(fetch_stderr):
                 cli.main(
                     [
                         "fetch",
@@ -688,7 +699,9 @@ class CliIntegrationTests(unittest.TestCase):
 
             select_stdout = io.StringIO()
             select_stderr = io.StringIO()
-            with redirect_stdout(select_stdout), redirect_stderr(select_stderr):
+            with patch.object(
+                cli, "ensure_installation", return_value=False
+            ), redirect_stdout(select_stdout), redirect_stderr(select_stderr):
                 cli.main(
                     [
                         "select",
@@ -734,7 +747,9 @@ class CliIntegrationTests(unittest.TestCase):
     def test_select_validation_failure_writes_only_a_stderr_error(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with patch.object(cli, "load_candidates", return_value=self.candidates):
+        with patch.object(cli, "load_candidates", return_value=self.candidates), patch.object(
+            cli, "ensure_installation", return_value=False
+        ):
             with redirect_stdout(stdout), redirect_stderr(stderr):
                 with self.assertRaises(SystemExit) as error:
                     cli.main(["select", "not-a-valid-selection"])
@@ -750,7 +765,9 @@ class CliIntegrationTests(unittest.TestCase):
             stdout = io.StringIO()
             stderr = io.StringIO()
 
-            with patch.object(cli, "load_candidates", return_value=[]):
+            with patch.object(cli, "load_candidates", return_value=[]), patch.object(
+                cli, "ensure_installation", return_value=False
+            ):
                 with redirect_stdout(stdout), redirect_stderr(stderr):
                     with self.assertRaises(SystemExit) as error:
                         cli.main(
@@ -853,39 +870,57 @@ class CliIntegrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             filmliste = Path(temporary_directory) / cli.FILMLISTE_FILENAME
             now = int(time.time())
+            excluded_titles = [
+                "Volle Kanne vom 14. August 2026",
+                "Wakefield (1/8)",
+                "Leichtathletik-EM: Frühsession vom 13. August",
+                "Trailer: Neue Serie",
+                "Brisant vom 10. August",
+                "Die Frankenschau vom 09.08.2026",
+                "Umschau_ MDR-Magazin vom 11. August",
+                "Markt - die ganze Sendung | 10.08.2026 (Gebärdensprache)",
+                "Visite | 11.08.2026 (Gebärdensprache)",
+                "Das große Hessenquiz vom 20.10.2024",
+                "BINGO! | 09.08.2026",
+                "Das Fifty-Fifty Quiz | 09.08.2026",
+                "Kaum zu glauben! | 09.08.2026",
+                "Inas Nacht mit Jan Ullrich und Özcan Coşar",
+                "STÖCKL vom 13.08.2026",
+                (
+                    "Sommergespräche 2026: Leonore Gewessler (Die Grünen) "
+                    "im Gespräch mit Simone Stribl (ÖGS)"
+                ),
+                "Sommer(nach)gespräche: Die Grünen",
+                "Sommer-Spaß mit Andy Borg 2026",
+                "Vorstadtweiber (1/10)",
+                "In der Tiefe – Maria Wern, Kripo Gotland (S07/E02)",
+                "Spuren des Bösen: Zauberberg",
+                "Blind ermittelt: Tod im Prater",
+                "Tag für Tag – Hotel Heidelberg",
+                "Kommen und Gehen - Hotel Heidelberg",
+                "SWR Sport mit KSC-Trainer Maximilian Senft",
+                "Sportclub live - 3. Liga: Rot-Weiss Essen - TSV Havelse",
+                "Champions League Quali: SK Sturm Graz - Fenerbahçe Istanbul",
+                (
+                    "Fußball 2. Liga: Blau-Weiß Linz - Wacker Innsbruck, "
+                    "Highlights aus Linz"
+                ),
+                (
+                    "Fußball Frauen Bundesliga: LASK - Sturm Graz, "
+                    "Highlights aus Linz"
+                ),
+            ]
+            preserved_titles = [
+                "ARTE Reportage - Russland / Madagaskar",
+                "Stadt Land Kunst - Japan / El Salvador / Delphi",
+                "Studio 54 - Hinter den Pforten des legendären Clubs",
+                "Folge 8: Doppelalarm für Christoph 9 (S11/E08)",
+                "Undercover in Saudi-Arabien (S02/E01)",
+                "Weltspiegel vom 9.8.2026",
+            ]
             entries = [
-                make_entry(
-                    "ZDF",
-                    "Volle Kanne vom 14. August 2026",
-                    "00:50:00",
-                    now,
-                ),
-                make_entry("ARTE.DE", "Wakefield (1/8)", "00:50:00", now),
-                make_entry(
-                    "ARD",
-                    "Leichtathletik-EM: Frühsession vom 13. August",
-                    "00:50:00",
-                    now,
-                ),
-                make_entry("ZDF", "Trailer: Neue Serie", "00:50:00", now),
-                make_entry(
-                    "ARTE.DE",
-                    "ARTE Reportage - Russland / Madagaskar",
-                    "00:50:00",
-                    now,
-                ),
-                make_entry(
-                    "ARTE.DE",
-                    "Stadt Land Kunst - Japan / El Salvador / Delphi",
-                    "00:50:00",
-                    now,
-                ),
-                make_entry(
-                    "ARTE.DE",
-                    "Studio 54 - Hinter den Pforten des legendären Clubs",
-                    "00:50:00",
-                    now,
-                ),
+                make_entry("ARTE.DE", title, "00:50:00", now)
+                for title in excluded_titles + preserved_titles
             ]
             write_filmliste(filmliste, entries)
 
@@ -897,11 +932,7 @@ class CliIntegrationTests(unittest.TestCase):
 
         self.assertEqual(
             [entry["title"] for entry in results],
-            [
-                "ARTE Reportage - Russland / Madagaskar",
-                "Stadt Land Kunst - Japan / El Salvador / Delphi",
-                "Studio 54 - Hinter den Pforten des legendären Clubs",
-            ],
+            preserved_titles,
         )
 
     def test_parser_uses_case_insensitive_title_regexes_from_filter_file(self):
@@ -968,6 +999,412 @@ class CliIntegrationTests(unittest.TestCase):
                 FilterConfigError, "Title filter file not found"
             ):
                 parser.load_title_filters(filter_file)
+
+
+class OnboardingTests(unittest.TestCase):
+    def setUp(self):
+        self.canonical_skill = REPOSITORY_ROOT / "SKILL.md"
+
+    def write_config(self, config_file, skill_root):
+        config_file.parent.mkdir(parents=True, exist_ok=True)
+        config_file.write_text(
+            json.dumps({"agent": "hermes", "skill_root": str(skill_root)}) + "\n",
+            encoding="utf-8",
+        )
+
+    def write_complete_installation(self, skill_root):
+        skill_directory = skill_root / "dokutipp"
+        skill_directory.mkdir(parents=True)
+        (skill_directory / "SKILL.md").write_bytes(self.canonical_skill.read_bytes())
+        (skill_directory / "PROFILE.md").write_text(
+            "# Personal Profile\n\n## Interests\n\nHistory\n",
+            encoding="utf-8",
+        )
+        return skill_directory
+
+    def read_skill_frontmatter(self):
+        content = self.canonical_skill.read_text(encoding="utf-8")
+        self.assertTrue(content.startswith("---\n"))
+        _opening, frontmatter, body = content.split("---", 2)
+        properties = {}
+        top_level_keys = []
+        for line in frontmatter.strip().splitlines():
+            if not line.startswith((" ", "\t")):
+                key, value = line.split(":", 1)
+                top_level_keys.append(key)
+                properties[key] = value.strip()
+        self.assertTrue(body.strip())
+        return properties, top_level_keys
+
+    def test_canonical_skill_frontmatter_matches_agent_skills_standard(self):
+        properties, top_level_keys = self.read_skill_frontmatter()
+        allowed_fields = {
+            "name",
+            "description",
+            "license",
+            "compatibility",
+            "metadata",
+            "allowed-tools",
+        }
+
+        self.assertEqual(len(top_level_keys), len(set(top_level_keys)))
+        self.assertLessEqual(set(top_level_keys), allowed_fields)
+        self.assertIn("name", properties)
+        self.assertIn("description", properties)
+        self.assertRegex(properties["name"], r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+        self.assertLessEqual(len(properties["name"]), 64)
+        self.assertEqual(properties["name"], onboarding.SKILL_DIRECTORY_NAME)
+        self.assertGreater(len(properties["description"]), 0)
+        self.assertLessEqual(len(properties["description"]), 1024)
+        self.assertIn("Use when", properties["description"])
+        self.assertLessEqual(len(properties["compatibility"]), 500)
+        self.assertLessEqual(
+            len(self.canonical_skill.read_text(encoding="utf-8").splitlines()),
+            500,
+        )
+
+    def test_first_bare_cli_run_installs_hermes_skill_and_profile(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            hermes_home = root / "hermes-home"
+            config_file = root / "config" / "dokutipp" / "config.json"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+
+            with redirect_stdout(stdout):
+                cli.main(
+                    [],
+                    config_file=config_file,
+                    input_stream=InteractiveInput("history and science\n1\nsports\n"),
+                    onboarding_output=stderr,
+                    environment={"HERMES_HOME": str(hermes_home)},
+                    home=root / "home",
+                )
+
+            skill_directory = hermes_home / "skills" / "dokutipp"
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(
+                json.loads(config_file.read_text(encoding="utf-8")),
+                {
+                    "agent": "hermes",
+                    "skill_root": str((hermes_home / "skills").resolve()),
+                },
+            )
+            self.assertEqual(
+                (skill_directory / "SKILL.md").read_bytes(),
+                self.canonical_skill.read_bytes(),
+            )
+            profile = (skill_directory / "PROFILE.md").read_text(encoding="utf-8")
+            self.assertIn("history and science", profile)
+            self.assertIn("sports", profile)
+            self.assertIn("comma-separated on one line", stderr.getvalue())
+            self.assertIn("DokuTipp setup is complete", stderr.getvalue())
+
+            subsequent_stdout = io.StringIO()
+            subsequent_stderr = io.StringIO()
+            with redirect_stdout(subsequent_stdout), redirect_stderr(subsequent_stderr):
+                with self.assertRaises(SystemExit) as error:
+                    cli.main(
+                        [],
+                        config_file=config_file,
+                        input_stream=io.StringIO(),
+                        environment={"HERMES_HOME": str(hermes_home)},
+                        home=root / "home",
+                    )
+            self.assertEqual(error.exception.code, 2)
+            self.assertEqual(subsequent_stdout.getvalue(), "")
+            self.assertIn("usage:", subsequent_stderr.getvalue())
+
+    def test_first_run_supports_a_manual_skill_root(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            manual_root = root / "manual-skills"
+            config_file = root / "config.json"
+
+            cli.main(
+                [],
+                config_file=config_file,
+                input_stream=InteractiveInput(
+                    f"nature\n2\n{manual_root}\ncelebrity news\n"
+                ),
+                onboarding_output=io.StringIO(),
+                home=root / "home",
+            )
+
+            self.assertTrue((manual_root / "dokutipp" / "SKILL.md").is_file())
+            self.assertEqual(
+                json.loads(config_file.read_text(encoding="utf-8"))["skill_root"],
+                str(manual_root.resolve()),
+            )
+
+    def test_preflight_repairs_missing_files_and_handles_modified_skill(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            config_file = root / "config.json"
+            skill_directory = self.write_complete_installation(skill_root)
+            self.write_config(config_file, skill_root)
+
+            (skill_directory / "SKILL.md").unlink()
+            onboarding.ensure_installation(
+                config_file=config_file,
+                input_stream=io.StringIO(),
+                output_stream=io.StringIO(),
+                canonical_skill_file=self.canonical_skill,
+            )
+            self.assertEqual(
+                (skill_directory / "SKILL.md").read_bytes(),
+                self.canonical_skill.read_bytes(),
+            )
+
+            (skill_directory / "PROFILE.md").unlink()
+            onboarding.ensure_installation(
+                config_file=config_file,
+                input_stream=InteractiveInput("technology\n\n"),
+                output_stream=io.StringIO(),
+                canonical_skill_file=self.canonical_skill,
+            )
+            self.assertIn(
+                "technology",
+                (skill_directory / "PROFILE.md").read_text(encoding="utf-8"),
+            )
+
+            skill_file = skill_directory / "SKILL.md"
+            skill_file.write_text("local change", encoding="utf-8")
+            onboarding.ensure_installation(
+                config_file=config_file,
+                input_stream=InteractiveInput("n\n"),
+                output_stream=io.StringIO(),
+                canonical_skill_file=self.canonical_skill,
+            )
+            self.assertEqual(skill_file.read_text(encoding="utf-8"), "local change")
+
+            onboarding.ensure_installation(
+                config_file=config_file,
+                input_stream=InteractiveInput("y\n"),
+                output_stream=io.StringIO(),
+                canonical_skill_file=self.canonical_skill,
+            )
+            self.assertEqual(skill_file.read_bytes(), self.canonical_skill.read_bytes())
+
+    def test_preflight_requires_a_terminal_for_missing_profile_or_modified_skill(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            config_file = root / "config.json"
+            skill_directory = self.write_complete_installation(skill_root)
+            self.write_config(config_file, skill_root)
+
+            (skill_directory / "PROFILE.md").unlink()
+            with self.assertRaisesRegex(onboarding.OnboardingError, "interactive terminal"):
+                onboarding.ensure_installation(
+                    config_file=config_file,
+                    input_stream=io.StringIO(),
+                    output_stream=io.StringIO(),
+                    canonical_skill_file=self.canonical_skill,
+                )
+
+            (skill_directory / "PROFILE.md").write_text("profile", encoding="utf-8")
+            (skill_directory / "SKILL.md").write_text("local change", encoding="utf-8")
+            with self.assertRaisesRegex(onboarding.OnboardingError, "interactive terminal"):
+                onboarding.ensure_installation(
+                    config_file=config_file,
+                    input_stream=io.StringIO(),
+                    output_stream=io.StringIO(),
+                    canonical_skill_file=self.canonical_skill,
+                )
+
+    def test_preflight_refuses_symlinked_skill_or_profile_files(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            config_file = root / "config.json"
+            skill_directory = self.write_complete_installation(skill_root)
+            self.write_config(config_file, skill_root)
+            external_target = root / "external-target"
+
+            skill_file = skill_directory / "SKILL.md"
+            skill_file.unlink()
+            skill_file.symlink_to(external_target)
+            with self.assertRaisesRegex(onboarding.OnboardingError, "symbolic link"):
+                onboarding.ensure_installation(
+                    config_file=config_file,
+                    input_stream=io.StringIO(),
+                    output_stream=io.StringIO(),
+                    canonical_skill_file=self.canonical_skill,
+                )
+
+            skill_file.unlink()
+            skill_file.write_bytes(self.canonical_skill.read_bytes())
+            profile_file = skill_directory / "PROFILE.md"
+            profile_file.unlink()
+            profile_file.symlink_to(external_target)
+            with self.assertRaisesRegex(onboarding.OnboardingError, "symbolic link"):
+                onboarding.ensure_installation(
+                    config_file=config_file,
+                    input_stream=io.StringIO(),
+                    output_stream=io.StringIO(),
+                    canonical_skill_file=self.canonical_skill,
+                )
+
+    def test_setup_preserves_or_replaces_an_existing_profile_after_confirmation(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            config_file = root / "config.json"
+            skill_directory = self.write_complete_installation(skill_root)
+            self.write_config(config_file, skill_root)
+            profile_file = skill_directory / "PROFILE.md"
+            original_profile = profile_file.read_text(encoding="utf-8")
+
+            cli.main(
+                ["setup"],
+                config_file=config_file,
+                input_stream=InteractiveInput("science\n2\n" + str(skill_root) + "\nwar\nn\n"),
+                onboarding_output=io.StringIO(),
+                canonical_skill_file=self.canonical_skill,
+            )
+            self.assertEqual(profile_file.read_text(encoding="utf-8"), original_profile)
+
+            cli.main(
+                ["setup"],
+                config_file=config_file,
+                input_stream=InteractiveInput("science\n2\n" + str(skill_root) + "\nwar\ny\n"),
+                onboarding_output=io.StringIO(),
+                canonical_skill_file=self.canonical_skill,
+            )
+            profile = profile_file.read_text(encoding="utf-8")
+            self.assertIn("science", profile)
+            self.assertIn("war", profile)
+
+    def test_unconfigured_noninteractive_fetch_has_no_stdout_and_skips_loading(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            config_file = Path(temporary_directory) / "config.json"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with patch.object(cli, "load_candidates") as load, redirect_stdout(
+                stdout
+            ), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    cli.main(
+                        ["fetch"],
+                        config_file=config_file,
+                        input_stream=io.StringIO(),
+                    )
+
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("interactive terminal", stderr.getvalue())
+        load.assert_not_called()
+
+    def test_configured_preflight_keeps_fetch_stdout_machine_readable(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            config_file = root / "config.json"
+            self.write_complete_installation(skill_root)
+            self.write_config(config_file, skill_root)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            candidates = [
+                make_candidate("One"),
+                make_candidate("Two"),
+                make_candidate("Three"),
+                make_candidate("Extra"),
+            ]
+
+            with patch.object(cli, "load_candidates", return_value=candidates), redirect_stdout(
+                stdout
+            ), redirect_stderr(stderr):
+                cli.main(
+                    ["fetch"],
+                    config_file=config_file,
+                    input_stream=io.StringIO(),
+                )
+
+        self.assertEqual(json.loads(stdout.getvalue())["status"], "ready")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_help_runs_preflight_before_argparse_output(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_file = root / "config.json"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    cli.main(
+                        ["--help"],
+                        config_file=config_file,
+                        input_stream=io.StringIO(),
+                    )
+            self.assertEqual(error.exception.code, 2)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertIn("interactive terminal", stderr.getvalue())
+
+            skill_root = root / "skills"
+            self.write_complete_installation(skill_root)
+            self.write_config(config_file, skill_root)
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    cli.main(
+                        ["--help"],
+                        config_file=config_file,
+                        input_stream=io.StringIO(),
+                    )
+
+        self.assertEqual(error.exception.code, 0)
+        self.assertIn("usage:", stdout.getvalue())
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_malformed_config_and_non_directory_root_are_reported(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_file = root / "config.json"
+            config_file.write_text("{invalid", encoding="utf-8")
+            with self.assertRaisesRegex(onboarding.OnboardingError, "Could not read"):
+                onboarding.ensure_installation(
+                    config_file=config_file,
+                    input_stream=io.StringIO(),
+                    output_stream=io.StringIO(),
+                )
+
+            skill_root = root / "not-a-directory"
+            skill_root.write_text("file", encoding="utf-8")
+            self.write_config(config_file, skill_root)
+            with self.assertRaisesRegex(onboarding.OnboardingError, "not a directory"):
+                onboarding.ensure_installation(
+                    config_file=config_file,
+                    input_stream=io.StringIO(),
+                    output_stream=io.StringIO(),
+                )
+
+    def test_canonical_skill_resolves_to_the_root_original_in_a_checkout(self):
+        self.assertEqual(onboarding.canonical_skill_path(), self.canonical_skill)
+        self.assertEqual(
+            onboarding.canonical_skill_path().read_bytes(),
+            self.canonical_skill.read_bytes(),
+        )
+
+    def test_default_paths_use_xdg_and_the_hermes_home_fallback(self):
+        home = Path("/tmp/dokutipp-home")
+        self.assertEqual(
+            onboarding.config_path(
+                environment={"XDG_CONFIG_HOME": "/tmp/dokutipp-xdg"},
+                home=home,
+            ),
+            Path("/tmp/dokutipp-xdg/dokutipp/config.json"),
+        )
+        self.assertEqual(
+            onboarding.config_path(environment={}, home=home),
+            home / ".config/dokutipp/config.json",
+        )
+        self.assertEqual(
+            onboarding.hermes_skill_root(environment={}, home=home),
+            home / ".hermes/skills",
+        )
 
 
 def make_candidate(

@@ -9,8 +9,9 @@ import sys
 import time
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, TextIO
+from typing import Any, Dict, Mapping, Optional, Sequence, TextIO
 
+from .onboarding import OnboardingError, ensure_installation, run_setup
 from .parser import (
     DEFAULT_CHANNELS,
     FilterConfigError,
@@ -232,6 +233,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         ),
     )
     add_filter_arguments(select_parser)
+
+    subparsers.add_parser(
+        "setup",
+        help="Interactively configure the DokuTipp skill installation.",
+    )
     return parser
 
 
@@ -239,10 +245,42 @@ def main(
     argv: Optional[Sequence[str]] = None,
     *,
     data_dir: Optional[Path] = None,
+    config_file: Optional[Path] = None,
+    input_stream: Optional[TextIO] = None,
+    onboarding_output: Optional[TextIO] = None,
+    canonical_skill_file: Optional[Path] = None,
+    environment: Optional[Mapping[str, str]] = None,
+    home: Optional[Path] = None,
 ) -> None:
     parser = build_argument_parser()
     arguments = list(sys.argv[1:] if argv is None else argv)
+
+    onboarding_options = {
+        "config_file": config_file,
+        "input_stream": input_stream,
+        "output_stream": onboarding_output,
+        "canonical_skill_file": canonical_skill_file,
+        "environment": environment,
+        "home": home,
+    }
+
+    if arguments == ["setup"]:
+        try:
+            run_setup(**onboarding_options)
+        except OnboardingError as error:
+            print(f"Error: {error}", file=sys.stderr)
+            raise SystemExit(2)
+        return
+
+    try:
+        setup_just_ran = ensure_installation(**onboarding_options)
+    except OnboardingError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        raise SystemExit(2)
+
     if not arguments:
+        if setup_just_ran:
+            return
         parser.print_help(file=sys.stderr)
         raise SystemExit(2)
 
@@ -265,6 +303,11 @@ def main(
                 channels=args.channels,
                 filter_file=args.filter_file,
             )
+        elif args.command == "setup":
+            # The exact `dokutipp setup` form was handled before preflight so it
+            # can deliberately reconfigure an existing installation.
+            parser.print_help(file=sys.stderr)
+            raise SystemExit(2)
         else:
             parser.print_help(file=sys.stderr)
             raise SystemExit(2)

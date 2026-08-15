@@ -54,11 +54,12 @@ source .venv/bin/activate
 python -m pip install --upgrade pip setuptools
 python -m pip install -e .
 
-dokutipp --help
+dokutipp
 ```
 
 `-e` installs the checkout in editable mode, so changes to the source are used
-immediately. After opening a new terminal, activate the environment again
+immediately. The first `dokutipp` invocation starts the interactive setup
+described below. After opening a new terminal, activate the environment again
 before using the command:
 
 ```bash
@@ -68,6 +69,46 @@ dokutipp --help
 ```
 
 Use `deactivate` to leave the virtual environment.
+
+## First start and skill setup
+
+On the first interactive `dokutipp` invocation, DokuTipp asks for your
+interests, the agent setup to use, and optional topics to avoid. It then saves
+the setup at `$XDG_CONFIG_HOME/dokutipp/config.json`; when
+`XDG_CONFIG_HOME` is unset, the location is `~/.config/dokutipp/config.json`.
+
+At present, Hermes Agent is the supported agent choice. Its skill root is
+`${HERMES_HOME:-~/.hermes}/skills`, so DokuTipp creates:
+
+```text
+${HERMES_HOME:-~/.hermes}/skills/dokutipp/
+├── SKILL.md
+└── PROFILE.md
+```
+
+You can instead enter a skill root manually. For a new root, DokuTipp creates
+the `dokutipp` folder below it, copies its original `SKILL.md` there, and
+creates the sibling `PROFILE.md` with the answers from onboarding. At an
+existing root it checks those files and asks before replacing an existing
+profile or a modified skill.
+
+A manually chosen root must already be scanned by Hermes. DokuTipp does not
+modify Hermes configuration or register external skill directories.
+
+`PROFILE.md` is your editable personal context: change interests or topics to
+avoid directly in that file whenever they change. The CLI does not overwrite an
+existing profile during its normal checks. Run `dokutipp setup` to choose a new
+skill root; it asks before replacing an existing profile.
+
+Before every normal command, including `fetch`, `select`, and help, DokuTipp
+checks that both files are present. `dokutipp setup` performs that setup itself
+so it can deliberately reconfigure an existing installation. The preflight
+restores a missing `SKILL.md` from the bundled original and asks to recreate a
+missing profile. If the installed `SKILL.md` differs from the bundled original,
+it asks whether it should restore the original. This leaves a declined local
+edit intact. A command that needs setup or an answer cannot run
+non-interactively: it exits with status 2 without writing a command result to
+stdout.
 
 ## Fetch and select
 
@@ -131,8 +172,9 @@ dokutipp select "ID1,ID2,ID3,xID4" --limit 50 --min-duration 60 \
 ```
 
 The `select` stdout is the complete final DokuTipp Markdown. Progress and error
-messages go to stderr. `dokutipp` without a subcommand prints help to stderr
-and exits with status 2.
+messages go to stderr. After setup, `dokutipp` without a subcommand prints help
+to stderr and exits with status 2; the first bare invocation performs setup and
+exits successfully.
 
 ### Filters
 
@@ -158,9 +200,10 @@ in `filters.txt`. Pass `--channels` to restrict the broadcaster selection.
 
 ## Skill integration
 
-`SKILL.md` is a thin agent integration layer. It handles profile context and
-the Fetch/Select handoff, while DokuTipp owns all final presentation. Agents
-must forward the final `select` stdout unchanged.
+The installed `dokutipp/SKILL.md` is a thin agent integration layer. It tells
+the agent to read its sibling `PROFILE.md`, make the Fetch/Select ID choice,
+and forward the final `select` stdout unchanged. DokuTipp owns all final
+presentation; agents must not add their own formatting.
 
 ## License
 

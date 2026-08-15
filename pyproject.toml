@@ -22,4 +22,4 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.data-files]
-"." = ["filters.txt"]
+"." = ["filters.txt", "SKILL.md"]

@@ -9,6 +9,12 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Added
 
+- Add first-run CLI onboarding for interests, optional topics to avoid, and a
+  Hermes or manually chosen skill root.
+- Add `dokutipp setup` for explicitly changing the configured skill root.
+- Install the bundled `SKILL.md` and a sibling editable `PROFILE.md` in a
+  `dokutipp` directory beneath the configured skill root, and verify them on
+  every CLI run.
 - Add a transparent, versioned `filters.txt` title-exclusion list with
   case-insensitive regular-expression support and a `--filter-file` override.
 - Include the active title-exclusion patterns in the `fetch` filter metadata.
