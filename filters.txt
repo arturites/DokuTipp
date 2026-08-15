@@ -2,6 +2,8 @@
 
 # News and weather editions
 Mittagsmagazin
+^Brisant vom \d{1,2}\.
+^Die Frankenschau vom \d{2}\.\d{2}\.\d{4}$
 ^tagesschau \d{1,2}:\d{2} Uhr
 ^Tagesschau vom \d{2}\.\d{2}\.\d{4}(?::|$)
 ^tagesschau in (?:100 Sekunden|Einfacher Sprache)\b
@@ -26,21 +28,33 @@ Mittagsmagazin
 ^MDR um 4\b
 ^Studio 2 vom \d{2}\.\d{2}\.\d{4}$
 ^Volle Kanne vom\b
+^Umschau_ MDR-Magazin vom \d{1,2}\.
+^Markt - die ganze Sendung \|
+^Visite \|
 ^13 Fragen:
 Die Trödel-Show mit Horst Lichter
 ^Bares für Rares(?: XXL)? (?:vom|-)
 - Lieblingsstücke vom \d{1,2}\.
 - Tagesmotto vom
 ^Der Quiz-Champion\b
+^Das große Hessenquiz vom \d{2}\.\d{2}\.\d{4}$
+^BINGO! \| \d{2}\.\d{2}\.\d{4}$
+^Das Fifty-Fifty Quiz \| \d{2}\.\d{2}\.\d{4}$
+^Kaum zu glauben! \| \d{2}\.\d{2}\.\d{4}$
 ^Smart10 - Das Quiz mit den zehn Möglichkeiten vom \d{2}\.\d{2}\.\d{4}$
 ^Gefragt [–-] Gejagt vom \d{2}\.\d{2}\.\d{4}$
 ^Wer weiß denn sowas\? \(\d+\)$
+^Inas Nacht mit\b
+^STÖCKL vom \d{2}\.\d{2}\.\d{4}$
+^Sommergespräche 20\d{2}:
+^Sommer\(nach\)gespräche:
 Duell(?:\*| )der(?:\*| )Gartenprofis
 ^Johann König findet:
 ^Martin Frank [–-] Live auf der Bühne!$
 ^Happy Hour Takeover mit
 ^Karlsplatz [–-] Mit
 ^Gernot Kulis: Kulisionen \(\d+/\d+\)$
+^Sommer-Spaß mit Andy Borg 20\d{2}$
 \bin kabarett\.com$
 
 # Fiction series and television films
@@ -59,6 +73,7 @@ Grantchester \(S\d{2}/E\d{2}\)
 Joan \(S\d{2}/E\d{2}\)
 Tage, die es nicht gab(?::| \| Staffel)
 Vorstadtweiber \(S\d{2}/E\d{2}\)
+^Vorstadtweiber \(\d+/\d+\)$
 Arcadia \(S\d{2}/E\d{2}\)
 Surface [·-] Das versunkene Dorf
 ^Rebecka Martinsson -
@@ -67,12 +82,15 @@ Surface [·-] Das versunkene Dorf
 Der (?:Amsterdam|Barcelona|Kroatien|Usedom)-Krimi
 (?:Kommissar|Mankells) Wallander
 ^Maria Wern, Kripo Gotland -
+[–-] Maria Wern, Kripo Gotland \(S\d{2}/E\d{2}\)$
+^Spuren des Bösen:
+^Blind ermittelt:
 [–-] Liebe am Fjord$
 [–-] Pfarrer Braun$
 [–-] Weingut Wader
 - Zimmer mit Stall$
 ^Die Toten am Meer -
-- Hotel Heidelberg$
+[–-] Hotel Heidelberg$
 ^Mordkommission Istanbul \(\d+\)
 [–-] Ein Fall für Nadja \(S\d{2}/E\d{2}\)
 ^Mord in bester Gesellschaft -
@@ -86,6 +104,10 @@ Schwimm-+EM.*(?:Vorl(?:auf|äufe)|Tag \d|Highlights|Mixed Staffel|High Diving|Sc
 ^Pferdesport FEI Weltmeisterschaft 20\d{2}(?:$|:)
 ^Fußball WM 20\d{2} Gruppe [A-Z] - MD\d:
 ^Conference League Quali: .+ - .+$
+^Champions League Quali: .+ - .+$
+^Fußball (?:2\. Liga|Frauen Bundesliga): .+ - .+, Highlights aus .+$
+^SWR Sport mit\b
+^Sportclub live -
 ^Rhythmische Sportgymnastik -
 ^Die (?:Früh|Spät|späte Schwimm)-Session\b
 ^Das Finale des Nationenpreis$
