@@ -74,8 +74,24 @@ Use `deactivate` to leave the virtual environment.
 
 On the first interactive `dokutipp` invocation, DokuTipp asks for your
 interests, the agent setup to use, and optional topics to avoid. It then saves
-the setup at `$XDG_CONFIG_HOME/dokutipp/config.json`; when
-`XDG_CONFIG_HOME` is unset, the location is `~/.config/dokutipp/config.json`.
+the setup at `~/.dokutipp/config.json` and creates the empty data directory at
+`~/.dokutipp/data/`.
+
+The new per-user state is independent of the current working directory:
+
+```text
+~/.dokutipp/
+├── config.json
+└── data/
+    ├── Filmliste-akt.xz
+    └── recommendation-history.json
+```
+
+Existing installations are intentionally not migrated. The former
+`$XDG_CONFIG_HOME/dokutipp/config.json` (or `~/.config/dokutipp/config.json`)
+and old checkout or working-directory `data/` folders remain untouched. The
+first command after this change runs onboarding again and starts with a fresh
+cache and recommendation history.
 
 At present, Hermes Agent is the supported agent choice. Its skill root is
 `${HERMES_HOME:-~/.hermes}/skills`, so DokuTipp creates:
@@ -151,7 +167,7 @@ SHA-256 hashes of the candidate's title, duration, broadcaster, date, and URL.
 
 After each successful `select`, DokuTipp stores all four selected hashes,
 including the extra recommendation, with their timestamps in the local
-`data/recommendation-history.json`. Subsequent `fetch` calls omit exact hash
+`~/.dokutipp/data/recommendation-history.json`. Subsequent `fetch` calls omit exact hash
 matches for seven days (7 x 24 hours). Expired entries are removed on the next
 history access, so those candidates can be recommended again without a manual
 reset. A damaged local history is reset automatically with a warning on stderr.
@@ -203,10 +219,12 @@ line. Empty lines and lines beginning with `#` are ignored; patterns are
 matched only against programme titles. Add a new title pattern to this file,
 or pass another file with `--filter-file` to both `fetch` and `select`.
 
-The default filter uses a 24-hour cache at `data/Filmliste-akt.xz`, downloads
-the list when necessary, considers entries from all broadcasters from the past
-seven days, and excludes future entries and titles matching the patterns listed
-in `filters.txt`. Pass `--channels` to restrict the broadcaster selection.
+The default filter uses a 24-hour cache at
+`~/.dokutipp/data/Filmliste-akt.xz`, downloads the list when necessary,
+considers entries from all broadcasters from the past seven days, and excludes
+future entries and titles matching the patterns listed in `filters.txt`. The
+`filters.txt` lookup and packaging remain unchanged. Pass `--channels` to
+restrict the broadcaster selection.
 
 ## Skill integration
 

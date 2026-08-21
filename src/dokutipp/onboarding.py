@@ -8,8 +8,9 @@ import sysconfig
 from pathlib import Path
 from typing import Mapping, Optional, TextIO
 
+from .paths import config_file as default_config_file, data_directory
 
-CONFIG_RELATIVE_PATH = Path("dokutipp") / "config.json"
+
 PROFILE_FILENAME = "PROFILE.md"
 SKILL_DIRECTORY_NAME = "dokutipp"
 SKILL_FILENAME = "SKILL.md"
@@ -49,13 +50,11 @@ def config_path(
     home: Optional[Path] = None,
 ) -> Path:
     """Return DokuTipp's user-specific setup file location."""
-    environment = os.environ if environment is None else environment
-    configured_root = environment.get("XDG_CONFIG_HOME")
-    if configured_root:
-        return Path(configured_root).expanduser() / CONFIG_RELATIVE_PATH
-    if home is None:
-        home = Path.home()
-    return home / ".config" / CONFIG_RELATIVE_PATH
+    # Keep the environment argument for callers that also inject it into the
+    # Hermes skill-root resolver. XDG_CONFIG_HOME is intentionally not used for
+    # DokuTipp's per-user application directory.
+    del environment
+    return default_config_file(home)
 
 
 def canonical_skill_path() -> Path:
@@ -233,6 +232,17 @@ def _write_config(config_file: Path, skill_root: Path) -> None:
         ) from error
 
 
+def _ensure_data_directory(data_dir: Path) -> None:
+    if data_dir.exists() and not data_dir.is_dir():
+        raise OnboardingError(f"DokuTipp data path is not a directory: {data_dir}")
+    try:
+        data_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise OnboardingError(
+            f"Could not create DokuTipp data directory {data_dir}: {error}"
+        ) from error
+
+
 def _canonical_skill_bytes(canonical_skill_file: Optional[Path]) -> bytes:
     path = canonical_skill_path() if canonical_skill_file is None else canonical_skill_file
     if not path.is_file():
@@ -339,6 +349,7 @@ def _ensure_profile_file(
 def run_setup(
     *,
     config_file: Optional[Path] = None,
+    data_dir: Optional[Path] = None,
     input_stream: Optional[TextIO] = None,
     output_stream: Optional[TextIO] = None,
     canonical_skill_file: Optional[Path] = None,
@@ -356,6 +367,8 @@ def run_setup(
         output_stream = sys.stderr
     if config_file is None:
         config_file = config_path(environment=environment, home=home)
+    if data_dir is None:
+        data_dir = data_directory(home)
 
     _require_interactive(input_stream)
     output_stream.write("Welcome to DokuTipp. Let's set up your profile.\n")
@@ -392,6 +405,7 @@ def run_setup(
         avoid=avoid,
         replace_existing=True,
     )
+    _ensure_data_directory(data_dir)
     _write_config(config_file, skill_root)
     output_stream.write("DokuTipp setup is complete.\n")
     return skill_root
@@ -400,6 +414,7 @@ def run_setup(
 def ensure_installation(
     *,
     config_file: Optional[Path] = None,
+    data_dir: Optional[Path] = None,
     input_stream: Optional[TextIO] = None,
     output_stream: Optional[TextIO] = None,
     canonical_skill_file: Optional[Path] = None,
@@ -417,11 +432,14 @@ def ensure_installation(
         output_stream = sys.stderr
     if config_file is None:
         config_file = config_path(environment=environment, home=home)
+    if data_dir is None:
+        data_dir = data_directory(home)
 
     skill_root = _load_config(config_file)
     if skill_root is None:
         run_setup(
             config_file=config_file,
+            data_dir=data_dir,
             input_stream=input_stream,
             output_stream=output_stream,
             canonical_skill_file=canonical_skill_file,
@@ -430,6 +448,7 @@ def ensure_installation(
         )
         return True
 
+    _ensure_data_directory(data_dir)
     skill_directory = _skill_directory(skill_root)
     skill_bytes = _canonical_skill_bytes(canonical_skill_file)
     _ensure_skill_file(

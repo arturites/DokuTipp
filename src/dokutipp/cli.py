@@ -17,6 +17,7 @@ from .history import (
     record_selected_ids,
 )
 from .onboarding import OnboardingError, ensure_installation, run_setup
+from .paths import data_directory
 from .parser import (
     DEFAULT_CHANNELS,
     FilterConfigError,
@@ -53,15 +54,9 @@ def log(message: str) -> None:
     )
 
 
-def default_data_dir() -> Path:
-    """Return the legacy checkout cache, or a local CLI cache when installed."""
-    package_file = Path(__file__).resolve()
-    checkout_root = package_file.parents[2]
-    if (checkout_root / "pyproject.toml").is_file() and (
-        checkout_root / "src" / "dokutipp"
-    ).is_dir():
-        return checkout_root / "data"
-    return Path.cwd() / "data"
+def default_data_dir(home: Optional[Path] = None) -> Path:
+    """Return DokuTipp's per-user cache directory."""
+    return data_directory(home)
 
 
 def default_history_file(data_dir: Optional[Path] = None) -> Path:
@@ -294,9 +289,13 @@ def main(
 ) -> None:
     parser = build_argument_parser()
     arguments = list(sys.argv[1:] if argv is None else argv)
+    effective_data_dir = (
+        data_dir if data_dir is not None else default_data_dir(home)
+    )
 
     onboarding_options = {
         "config_file": config_file,
+        "data_dir": effective_data_dir,
         "input_stream": input_stream,
         "output_stream": onboarding_output,
         "canonical_skill_file": canonical_skill_file,
@@ -328,7 +327,7 @@ def main(
     try:
         if args.command == "fetch":
             run_fetch(
-                data_dir=data_dir,
+                data_dir=effective_data_dir,
                 limit=args.limit,
                 min_duration=args.min_duration,
                 channels=args.channels,
@@ -339,7 +338,7 @@ def main(
         elif args.command == "select":
             run_select(
                 args.ids,
-                data_dir=data_dir,
+                data_dir=effective_data_dir,
                 limit=args.limit,
                 min_duration=args.min_duration,
                 channels=args.channels,

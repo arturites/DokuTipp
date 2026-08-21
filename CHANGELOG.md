@@ -5,6 +5,22 @@ All notable changes to DokuTipp are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Create the per-user `~/.dokutipp/` directory after onboarding, including
+  `config.json` and the `data/` directory for the MediathekView cache and
+  recommendation history.
+
+### Changed
+
+- Use `~/.dokutipp/config.json` and `~/.dokutipp/data/` as the default paths,
+  independent of the current working directory and `XDG_CONFIG_HOME`.
+- Leave existing XDG, checkout, and working-directory state untouched instead
+  of migrating it automatically; affected installations run onboarding again.
+- Keep the existing `filters.txt` path resolution and packaging unchanged.
+
 ## [2.0.0] - 2026-08-15
 
 ### Added

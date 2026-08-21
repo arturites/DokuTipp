@@ -1538,22 +1538,24 @@ class OnboardingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             hermes_home = root / "hermes-home"
-            config_file = root / "config" / "dokutipp" / "config.json"
+            home = root / "home"
+            config_file = home / ".dokutipp" / "config.json"
             stdout = io.StringIO()
             stderr = io.StringIO()
 
             with redirect_stdout(stdout):
                 cli.main(
                     [],
-                    config_file=config_file,
                     input_stream=InteractiveInput("history and science\n1\nsports\n"),
                     onboarding_output=stderr,
                     environment={"HERMES_HOME": str(hermes_home)},
-                    home=root / "home",
+                    home=home,
                 )
 
             skill_directory = hermes_home / "skills" / "dokutipp"
             self.assertEqual(stdout.getvalue(), "")
+            self.assertTrue((home / ".dokutipp" / "data").is_dir())
+            self.assertFalse((home / ".dokutipp" / "filters.txt").exists())
             self.assertEqual(
                 json.loads(config_file.read_text(encoding="utf-8")),
                 {
@@ -1577,29 +1579,57 @@ class OnboardingTests(unittest.TestCase):
                 with self.assertRaises(SystemExit) as error:
                     cli.main(
                         [],
-                        config_file=config_file,
                         input_stream=io.StringIO(),
                         environment={"HERMES_HOME": str(hermes_home)},
-                        home=root / "home",
+                        home=home,
                     )
             self.assertEqual(error.exception.code, 2)
             self.assertEqual(subsequent_stdout.getvalue(), "")
             self.assertIn("usage:", subsequent_stderr.getvalue())
 
+    def test_new_onboarding_does_not_read_or_modify_legacy_config_or_data(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            hermes_home = root / "hermes-home"
+            legacy_config = root / "xdg" / "dokutipp" / "config.json"
+            legacy_skill_root = root / "legacy-skills"
+            self.write_config(legacy_config, legacy_skill_root)
+            legacy_data = root / "data"
+            legacy_data.mkdir()
+            legacy_cache = legacy_data / cli.FILMLISTE_FILENAME
+            legacy_cache.write_bytes(b"legacy-cache")
+
+            cli.main(
+                [],
+                input_stream=InteractiveInput("history\n1\n\n"),
+                onboarding_output=io.StringIO(),
+                environment={
+                    "XDG_CONFIG_HOME": str(root / "xdg"),
+                    "HERMES_HOME": str(hermes_home),
+                },
+                home=home,
+            )
+
+            self.assertTrue((home / ".dokutipp" / "config.json").is_file())
+            self.assertEqual(json.loads(legacy_config.read_text(encoding="utf-8"))["skill_root"], str(legacy_skill_root))
+            self.assertEqual(legacy_cache.read_bytes(), b"legacy-cache")
+            self.assertFalse((home / ".dokutipp" / "data" / cli.FILMLISTE_FILENAME).exists())
+
     def test_first_run_supports_a_manual_skill_root(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             manual_root = root / "manual-skills"
-            config_file = root / "config.json"
+            home = root / "home"
+            config_file = home / ".dokutipp" / "config.json"
 
             cli.main(
                 [],
-                config_file=config_file,
                 input_stream=InteractiveInput(
                     f"nature\n2\n{manual_root}\ncelebrity news\n"
                 ),
                 onboarding_output=io.StringIO(),
-                home=root / "home",
+                home=home,
             )
 
             self.assertTrue((manual_root / "dokutipp" / "SKILL.md").is_file())
@@ -1619,6 +1649,7 @@ class OnboardingTests(unittest.TestCase):
             (skill_directory / "SKILL.md").unlink()
             onboarding.ensure_installation(
                 config_file=config_file,
+                home=root / "home",
                 input_stream=io.StringIO(),
                 output_stream=io.StringIO(),
                 canonical_skill_file=self.canonical_skill,
@@ -1627,10 +1658,22 @@ class OnboardingTests(unittest.TestCase):
                 (skill_directory / "SKILL.md").read_bytes(),
                 self.canonical_skill.read_bytes(),
             )
+            data_dir = root / "home" / ".dokutipp" / "data"
+            self.assertTrue(data_dir.is_dir())
+            data_dir.rmdir()
+            onboarding.ensure_installation(
+                config_file=config_file,
+                home=root / "home",
+                input_stream=io.StringIO(),
+                output_stream=io.StringIO(),
+                canonical_skill_file=self.canonical_skill,
+            )
+            self.assertTrue(data_dir.is_dir())
 
             (skill_directory / "PROFILE.md").unlink()
             onboarding.ensure_installation(
                 config_file=config_file,
+                home=root / "home",
                 input_stream=InteractiveInput("technology\n\n"),
                 output_stream=io.StringIO(),
                 canonical_skill_file=self.canonical_skill,
@@ -1644,6 +1687,7 @@ class OnboardingTests(unittest.TestCase):
             skill_file.write_text("local change", encoding="utf-8")
             onboarding.ensure_installation(
                 config_file=config_file,
+                home=root / "home",
                 input_stream=InteractiveInput("n\n"),
                 output_stream=io.StringIO(),
                 canonical_skill_file=self.canonical_skill,
@@ -1652,6 +1696,7 @@ class OnboardingTests(unittest.TestCase):
 
             onboarding.ensure_installation(
                 config_file=config_file,
+                home=root / "home",
                 input_stream=InteractiveInput("y\n"),
                 output_stream=io.StringIO(),
                 canonical_skill_file=self.canonical_skill,
@@ -1670,6 +1715,7 @@ class OnboardingTests(unittest.TestCase):
             with self.assertRaisesRegex(onboarding.OnboardingError, "interactive terminal"):
                 onboarding.ensure_installation(
                     config_file=config_file,
+                    home=root / "home",
                     input_stream=io.StringIO(),
                     output_stream=io.StringIO(),
                     canonical_skill_file=self.canonical_skill,
@@ -1680,6 +1726,7 @@ class OnboardingTests(unittest.TestCase):
             with self.assertRaisesRegex(onboarding.OnboardingError, "interactive terminal"):
                 onboarding.ensure_installation(
                     config_file=config_file,
+                    home=root / "home",
                     input_stream=io.StringIO(),
                     output_stream=io.StringIO(),
                     canonical_skill_file=self.canonical_skill,
@@ -1700,6 +1747,7 @@ class OnboardingTests(unittest.TestCase):
             with self.assertRaisesRegex(onboarding.OnboardingError, "symbolic link"):
                 onboarding.ensure_installation(
                     config_file=config_file,
+                    home=root / "home",
                     input_stream=io.StringIO(),
                     output_stream=io.StringIO(),
                     canonical_skill_file=self.canonical_skill,
@@ -1713,6 +1761,7 @@ class OnboardingTests(unittest.TestCase):
             with self.assertRaisesRegex(onboarding.OnboardingError, "symbolic link"):
                 onboarding.ensure_installation(
                     config_file=config_file,
+                    home=root / "home",
                     input_stream=io.StringIO(),
                     output_stream=io.StringIO(),
                     canonical_skill_file=self.canonical_skill,
@@ -1731,6 +1780,7 @@ class OnboardingTests(unittest.TestCase):
             cli.main(
                 ["setup"],
                 config_file=config_file,
+                home=root / "home",
                 input_stream=InteractiveInput("science\n2\n" + str(skill_root) + "\nwar\nn\n"),
                 onboarding_output=io.StringIO(),
                 canonical_skill_file=self.canonical_skill,
@@ -1740,6 +1790,7 @@ class OnboardingTests(unittest.TestCase):
             cli.main(
                 ["setup"],
                 config_file=config_file,
+                home=root / "home",
                 input_stream=InteractiveInput("science\n2\n" + str(skill_root) + "\nwar\ny\n"),
                 onboarding_output=io.StringIO(),
                 canonical_skill_file=self.canonical_skill,
@@ -1790,6 +1841,7 @@ class OnboardingTests(unittest.TestCase):
                 cli.main(
                     ["fetch"],
                     config_file=config_file,
+                    home=root / "home",
                     input_stream=io.StringIO(),
                     history_file=root / "recommendation-history.json",
                 )
@@ -1808,6 +1860,7 @@ class OnboardingTests(unittest.TestCase):
                     cli.main(
                         ["--help"],
                         config_file=config_file,
+                        home=root / "home",
                         input_stream=io.StringIO(),
                     )
             self.assertEqual(error.exception.code, 2)
@@ -1824,6 +1877,7 @@ class OnboardingTests(unittest.TestCase):
                     cli.main(
                         ["--help"],
                         config_file=config_file,
+                        home=root / "home",
                         input_stream=io.StringIO(),
                     )
 
@@ -1839,6 +1893,7 @@ class OnboardingTests(unittest.TestCase):
             with self.assertRaisesRegex(onboarding.OnboardingError, "Could not read"):
                 onboarding.ensure_installation(
                     config_file=config_file,
+                    home=root / "home",
                     input_stream=io.StringIO(),
                     output_stream=io.StringIO(),
                 )
@@ -1849,6 +1904,7 @@ class OnboardingTests(unittest.TestCase):
             with self.assertRaisesRegex(onboarding.OnboardingError, "not a directory"):
                 onboarding.ensure_installation(
                     config_file=config_file,
+                    home=root / "home",
                     input_stream=io.StringIO(),
                     output_stream=io.StringIO(),
                 )
@@ -1860,18 +1916,22 @@ class OnboardingTests(unittest.TestCase):
             self.canonical_skill.read_bytes(),
         )
 
-    def test_default_paths_use_xdg_and_the_hermes_home_fallback(self):
+    def test_default_paths_use_the_dokutipp_home_and_hermes_home_fallback(self):
         home = Path("/tmp/dokutipp-home")
         self.assertEqual(
             onboarding.config_path(
                 environment={"XDG_CONFIG_HOME": "/tmp/dokutipp-xdg"},
                 home=home,
             ),
-            Path("/tmp/dokutipp-xdg/dokutipp/config.json"),
+            home / ".dokutipp/config.json",
         )
         self.assertEqual(
             onboarding.config_path(environment={}, home=home),
-            home / ".config/dokutipp/config.json",
+            home / ".dokutipp/config.json",
+        )
+        self.assertEqual(
+            cli.default_data_dir(home),
+            home / ".dokutipp/data",
         )
         self.assertEqual(
             onboarding.hermes_skill_root(environment={}, home=home),
