@@ -79,7 +79,14 @@ DokuTipp asks you for:
 1. documentary topics that interest you, entered comma-separated on one line,
    for example `history, science, nature`;
 2. where your preferred AI agent loads its skills from;
-3. optional topics you do not want recommended.
+3. optional topics you do not want recommended;
+4. which broadcasters DokuTipp should include.
+
+The broadcaster list uses arrow keys for navigation. Press space to include or
+exclude the highlighted broadcaster and Enter to confirm. Included broadcasters
+are shown as `- [x] ARD`; excluded broadcasters are shown as `- [ ] ARD`.
+DokuTipp refreshes or reuses its MediathekView cache before showing this current
+broadcaster list.
 
 You can accept the suggested skill location or enter another one. If you choose
 a different location, your AI agent must already know that directory as a
@@ -88,7 +95,10 @@ skill directory.
 DokuTipp saves an editable `PROFILE.md` in the installed skill folder. You can
 change your interests and excluded topics in that file at any time. Run
 `dokutipp setup` if you want to repeat the setup or choose a different skill
-location.
+location. Personal broadcaster exclusions are stored one literal name per line
+in `~/.dokutipp/senders.txt`; blank lines and `#` comments are ignored. The
+absolute path is stored as `sender_filter_file` in
+`~/.dokutipp/config.json`, so it can be changed manually when needed.
 
 ## Getting recommendations
 
@@ -99,7 +109,8 @@ After setup, ask your agent in natural language, for example:
 The agent reads your profile, asks DokuTipp for current candidates, and returns
 the finished recommendations. DokuTipp automatically downloads the current
 film list when needed and takes care of filtering, links, formatting, and
-recently recommended programmes.
+recently recommended programmes. The personal broadcaster exclusions apply
+automatically to both candidate fetching and final selection.
 
 ## Updating and troubleshooting
 
@@ -143,11 +154,12 @@ Both commands support these filters:
 | --- | --- | --- |
 | `--limit N` | no limit | Limit the number of candidates. |
 | `--min-duration MINUTES` | `42` | Exclude shorter programmes. |
-| `--channels CHANNEL ...` | all channels | Include only selected broadcasters. |
 | `--filter-file PATH` | bundled `filters.txt` | Use another title-exclusion list. |
 
 The bundled `filters.txt` contains case-insensitive regular expressions, one
 per line. Blank lines and lines beginning with `#` are ignored.
+Broadcaster exclusions are personal configuration and therefore have no CLI
+override. The `fetch` JSON reports them as `filters.excluded_channels`.
 
 </details>
 

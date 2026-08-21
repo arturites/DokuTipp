@@ -64,7 +64,7 @@ def build_fetch_payload(
     *,
     limit: Optional[int],
     min_duration: int,
-    channels: Sequence[str],
+    excluded_channels: Sequence[str],
     title_filters: Sequence[str] = (),
     excluded_ids: AbstractSet[str] = frozenset(),
     message: str = "",
@@ -109,7 +109,7 @@ def build_fetch_payload(
         "filters": {
             "limit": limit,
             "min_duration": min_duration,
-            "channels": list(channels),
+            "excluded_channels": list(excluded_channels),
             "title_exclusions": list(title_filters),
         },
         "candidates": candidate_payload,

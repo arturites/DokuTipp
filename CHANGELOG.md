@@ -5,13 +5,20 @@ All notable changes to DokuTipp are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.1.0] - 2026-08-21
 
 ### Added
 
 - Create the per-user `~/.dokutipp/` directory after onboarding, including
   `config.json` and the `data/` directory for the MediathekView cache and
   recommendation history.
+- Add an interactive broadcaster selection to onboarding with arrow-key and
+  space-bar controls and plain `- [x]`/`- [ ]` checkbox markers. Store unchecked
+  broadcasters as literal, case-insensitive exclusions in the personal
+  `~/.dokutipp/senders.txt` file.
+- Store the absolute personal sender-filter path as `sender_filter_file` in
+  `~/.dokutipp/config.json` and include active exclusions in fetch metadata as
+  `filters.excluded_channels`.
 
 ### Changed
 
@@ -23,6 +30,15 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Leave existing XDG, checkout, and working-directory state untouched instead
   of migrating it automatically; affected installations run onboarding again.
 - Keep the existing `filters.txt` path resolution and packaging unchanged.
+- Refresh the MediathekView cache atomically during setup and fall back to a
+  readable existing cache when a refresh fails.
+- Apply the personal broadcaster exclusions automatically to both `fetch` and
+  `select` instead of requiring repeated command-line values.
+
+### Removed
+
+- Remove the `--channels` broadcaster inclusion filter from the supported CLI
+  and parser API.
 
 ## [2.0.0] - 2026-08-15
 
@@ -72,4 +88,6 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 - Remove the `scripts/start_curation.py` compatibility wrapper.
 - Remove the `scripts/parse_filmliste.py` compatibility wrapper.
 
+[Unreleased]: https://github.com/arturites/DokuTipp/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/arturites/DokuTipp/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/arturites/DokuTipp/compare/v1.3.0...v2.0.0

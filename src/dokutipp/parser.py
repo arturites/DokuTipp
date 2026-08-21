@@ -21,8 +21,6 @@ IDX_WEBSITE = 9     # Mediathek page URL
 IDX_DATUM_L = 16    # Unix timestamp as string
 
 SEVEN_DAYS = 7 * 24 * 3600
-# An empty selection means that no broadcaster preference is applied.
-DEFAULT_CHANNELS: Tuple[str, ...] = ()
 FILTER_FILENAME = "filters.txt"
 
 
@@ -82,6 +80,42 @@ def load_title_filters(
     return tuple(patterns)
 
 
+def _channel_key(channel: object) -> str:
+    """Return the normalized key used for literal broadcaster matching."""
+    return str(channel).strip().casefold()
+
+
+def load_sender_filters(
+    filter_file: Optional[Union[str, Path]],
+) -> Tuple[str, ...]:
+    """Read literal, case-insensitive broadcaster exclusions from a file."""
+    if filter_file is None:
+        return ()
+    path = Path(filter_file)
+    if not path.is_file():
+        raise FilterConfigError(f"Sender filter file not found: {path}")
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError) as error:
+        raise FilterConfigError(
+            f"Could not read sender filter file {path}: {error}"
+        ) from error
+
+    senders = []
+    seen = set()
+    for line in lines:
+        sender = line.strip()
+        if not sender or sender.startswith("#"):
+            continue
+        key = _channel_key(sender)
+        if key in seen:
+            continue
+        seen.add(key)
+        senders.append(sender)
+    return tuple(senders)
+
+
 def parse_raw(data: str) -> list:
     """Extract all (key, value) pairs from the non-standard duplicate-key JSON.
 
@@ -137,16 +171,34 @@ def parse_raw(data: str) -> list:
     return pairs
 
 
+def available_channels(file_path: Union[str, Path]) -> Tuple[str, ...]:
+    """Return all broadcasters in a film list after delta decoding."""
+    with lzma.open(file_path, "rt", encoding="utf-8") as file_handle:
+        pairs = parse_raw(file_handle.read())
+
+    last_sender = ""
+    channels = {}
+    for key, value in pairs:
+        if key != "X":
+            continue
+        sender = value[IDX_SENDER] if value[IDX_SENDER] else last_sender
+        last_sender = sender
+        normalized = _channel_key(sender)
+        if normalized and normalized not in channels:
+            channels[normalized] = str(sender).strip()
+    return tuple(sorted(channels.values(), key=_channel_key))
+
+
 def parse_filmliste(
     file_path: Union[str, Path],
     *,
     limit: Optional[int] = None,
     min_duration: int = 0,
-    channels: Sequence[str] = DEFAULT_CHANNELS,
+    excluded_channels: Sequence[str] = (),
     filter_file: Optional[Union[str, Path]] = None,
 ) -> list:
     """Return the existing filtered candidate list from *file_path*."""
-    allowed_channels = set(channels)
+    excluded_channel_keys = {_channel_key(channel) for channel in excluded_channels}
     title_filters = tuple(
         re.compile(pattern, re.IGNORECASE)
         for pattern in load_title_filters(filter_file)
@@ -174,7 +226,7 @@ def parse_filmliste(
         last_sender = sender
         last_thema = thema
 
-        if allowed_channels and sender not in allowed_channels:
+        if _channel_key(sender) in excluded_channel_keys:
             continue
 
         try:
@@ -241,11 +293,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Exclude entries shorter than MINUTES minutes (default: 0)",
     )
     parser.add_argument(
-        "--channels",
-        nargs="+",
-        default=DEFAULT_CHANNELS,
-        metavar="CHANNEL",
-        help="Channels to include (default: all channels)",
+        "--sender-filter-file",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Literal sender-exclusion file (default: no exclusions)",
     )
     parser.add_argument(
         "--filter-file",
@@ -260,11 +312,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
 def main(argv: Optional[Sequence[str]] = None) -> None:
     args = build_argument_parser().parse_args(argv)
     try:
+        excluded_channels = load_sender_filters(args.sender_filter_file)
         results = parse_filmliste(
             args.file,
             limit=args.limit,
             min_duration=args.min_duration,
-            channels=args.channels,
+            excluded_channels=excluded_channels,
             filter_file=args.filter_file,
         )
     except FilterConfigError as error:

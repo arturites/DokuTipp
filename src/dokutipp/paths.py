@@ -9,6 +9,7 @@ from typing import Optional
 APP_DIRECTORY_NAME = ".dokutipp"
 CONFIG_FILENAME = "config.json"
 DATA_DIRECTORY_NAME = "data"
+SENDER_FILTER_FILENAME = "senders.txt"
 
 
 def app_directory(home: Optional[Path] = None) -> Path:
@@ -26,3 +27,8 @@ def config_file(home: Optional[Path] = None) -> Path:
 def data_directory(home: Optional[Path] = None) -> Path:
     """Return DokuTipp's per-user cache and history directory."""
     return app_directory(home) / DATA_DIRECTORY_NAME
+
+
+def sender_filter_file(home: Optional[Path] = None) -> Path:
+    """Return the default personal broadcaster-exclusion file."""
+    return app_directory(home) / SENDER_FILTER_FILENAME

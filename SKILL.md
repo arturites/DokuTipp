@@ -28,11 +28,12 @@ and topics to avoid only as editorial context; do not pass it to the CLI.
 3. Run `dokutipp select "ID1,ID2,ID3,xID4" [the same filters]`. Use complete
    IDs from `fetch` and repeat its filter values exactly.
 
-Relevant filters are `--limit`, `--min-duration`, `--channels`, and
-`--filter-file`. Choose `--limit` and `--min-duration` freely; their defaults
-are not requirements. The default `filters.txt` contains case-insensitive title
+Relevant command filters are `--limit`, `--min-duration`, and `--filter-file`.
+Choose `--limit` and `--min-duration` freely; their defaults are not
+requirements. The default `filters.txt` contains case-insensitive title
 exclusion patterns. When using a custom filter file, repeat the same
-`--filter-file` value for `select`.
+`--filter-file` value for `select`. Personal broadcaster exclusions from the
+DokuTipp config apply automatically; do not try to replace or bypass them.
 
 If `fetch` reports `no_candidates` or `insufficient_candidates`, do not select
 anything; forward its CLI-provided `message` unchanged.

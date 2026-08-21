@@ -4,23 +4,37 @@ from __future__ import annotations
 
 import argparse
 import json
-import subprocess
 import sys
-import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, TextIO
 
+from . import __version__
 from .history import (
     RecommendationHistoryError,
     load_recent_ids,
     record_selected_ids,
 )
-from .onboarding import OnboardingError, ensure_installation, run_setup
+from .filmliste import (
+    DOWNLOAD_URL,
+    FILMLISTE_FILENAME,
+    MAX_AGE_SECONDS,
+    FilmlisteError,
+    ensure_filmliste as prepare_filmliste,
+    needs_download,
+)
+from .onboarding import (
+    OnboardingError,
+    SenderSelector,
+    config_path,
+    ensure_installation,
+    load_config,
+    run_setup,
+)
 from .paths import data_directory
 from .parser import (
-    DEFAULT_CHANNELS,
     FilterConfigError,
+    load_sender_filters,
     load_title_filters,
     parse_filmliste,
 )
@@ -38,10 +52,7 @@ from .selection import (
 )
 
 
-FILMLISTE_FILENAME = "Filmliste-akt.xz"
 HISTORY_FILENAME = "recommendation-history.json"
-DOWNLOAD_URL = "https://liste.mediathekview.de/Filmliste-akt.xz"
-MAX_AGE_SECONDS = 24 * 3600
 DEFAULT_LIMIT: Optional[int] = None
 DEFAULT_MIN_DURATION = 42
 
@@ -70,28 +81,13 @@ def _history_warning(message: str) -> None:
     print(f"Warning: {message}", file=sys.stderr)
 
 
-def needs_download(filmliste: Path) -> bool:
-    if not filmliste.exists():
-        return True
-    return time.time() - filmliste.stat().st_mtime > MAX_AGE_SECONDS
-
-
 def ensure_filmliste(data_dir: Path) -> Path:
     """Create or refresh the existing local MediathekView cache."""
-    data_dir.mkdir(parents=True, exist_ok=True)
-    filmliste = data_dir / FILMLISTE_FILENAME
-
-    if needs_download(filmliste):
-        log("Downloading Filmliste-akt.xz ...")
-        result = subprocess.run(["curl", "-fsSL", "-o", str(filmliste), DOWNLOAD_URL])
-        if result.returncode != 0:
-            print("Error: Download of Filmliste-akt.xz failed.", file=sys.stderr)
-            raise SystemExit(1)
-        log("Download complete.")
-    else:
-        log("Filmliste-akt.xz is fresh, skipping download.")
-
-    return filmliste
+    try:
+        return prepare_filmliste(data_dir, log=log)
+    except FilmlisteError as error:
+        print(f"Error: {error}", file=sys.stderr)
+        raise SystemExit(1)
 
 
 def load_candidates(
@@ -99,7 +95,7 @@ def load_candidates(
     data_dir: Optional[Path] = None,
     limit: Optional[int] = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
-    channels: Sequence[str] = DEFAULT_CHANNELS,
+    excluded_channels: Sequence[str] = (),
     filter_file: Optional[Path] = None,
 ) -> list:
     """Load the cache and reuse the existing MediathekView parser filters."""
@@ -110,7 +106,7 @@ def load_candidates(
         filmliste,
         limit=limit,
         min_duration=min_duration,
-        channels=channels,
+        excluded_channels=excluded_channels,
         filter_file=filter_file,
     )
 
@@ -120,7 +116,7 @@ def run_fetch(
     data_dir: Optional[Path] = None,
     limit: Optional[int] = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
-    channels: Sequence[str] = DEFAULT_CHANNELS,
+    excluded_channels: Sequence[str] = (),
     filter_file: Optional[Path] = None,
     output: Optional[TextIO] = None,
     today: Optional[date] = None,
@@ -137,7 +133,7 @@ def run_fetch(
         data_dir=data_dir,
         limit=limit,
         min_duration=min_duration,
-        channels=channels,
+        excluded_channels=excluded_channels,
         filter_file=filter_file,
     )
     title_filters = load_title_filters(filter_file)
@@ -150,7 +146,7 @@ def run_fetch(
         candidates,
         limit=limit,
         min_duration=min_duration,
-        channels=channels,
+        excluded_channels=excluded_channels,
         title_filters=title_filters,
         excluded_ids=recent_ids,
     )
@@ -173,7 +169,7 @@ def run_select(
     data_dir: Optional[Path] = None,
     limit: Optional[int] = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
-    channels: Sequence[str] = DEFAULT_CHANNELS,
+    excluded_channels: Sequence[str] = (),
     filter_file: Optional[Path] = None,
     output: Optional[TextIO] = None,
     today: Optional[date] = None,
@@ -190,7 +186,7 @@ def run_select(
         data_dir=data_dir,
         limit=limit,
         min_duration=min_duration,
-        channels=channels,
+        excluded_channels=excluded_channels,
         filter_file=filter_file,
     )
     selection = resolve_selection(selection_argument, candidates)
@@ -224,13 +220,6 @@ def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
         help="Exclude entries shorter than MINUTES minutes (default: 42)",
     )
     parser.add_argument(
-        "--channels",
-        nargs="+",
-        default=DEFAULT_CHANNELS,
-        metavar="CHANNEL",
-        help="Channels to include (default: all channels)",
-    )
-    parser.add_argument(
         "--filter-file",
         type=Path,
         default=None,
@@ -244,6 +233,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         description=(
             "Fetch MediathekView candidates or render a selected 3+1 DokuTipp result."
         )
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"dokutipp {__version__}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -286,21 +280,31 @@ def main(
     home: Optional[Path] = None,
     history_file: Optional[Path] = None,
     history_now: Optional[float] = None,
+    sender_selector: Optional[SenderSelector] = None,
 ) -> None:
     parser = build_argument_parser()
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments == ["--version"]:
+        parser.parse_args(arguments)
+        return
     effective_data_dir = (
         data_dir if data_dir is not None else default_data_dir(home)
     )
+    effective_config_file = (
+        config_file
+        if config_file is not None
+        else config_path(environment=environment, home=home)
+    )
 
     onboarding_options = {
-        "config_file": config_file,
+        "config_file": effective_config_file,
         "data_dir": effective_data_dir,
         "input_stream": input_stream,
         "output_stream": onboarding_output,
         "canonical_skill_file": canonical_skill_file,
         "environment": environment,
         "home": home,
+        "sender_selector": sender_selector,
     }
 
     if arguments == ["setup"]:
@@ -325,12 +329,18 @@ def main(
 
     args = parser.parse_args(arguments)
     try:
+        app_config = load_config(effective_config_file)
+        if app_config is None:
+            raise OnboardingError(
+                f"DokuTipp config is missing after setup: {effective_config_file}"
+            )
+        excluded_channels = load_sender_filters(app_config.sender_filter_file)
         if args.command == "fetch":
             run_fetch(
                 data_dir=effective_data_dir,
                 limit=args.limit,
                 min_duration=args.min_duration,
-                channels=args.channels,
+                excluded_channels=excluded_channels,
                 filter_file=args.filter_file,
                 history_file=history_file,
                 history_now=history_now,
@@ -341,7 +351,7 @@ def main(
                 data_dir=effective_data_dir,
                 limit=args.limit,
                 min_duration=args.min_duration,
-                channels=args.channels,
+                excluded_channels=excluded_channels,
                 filter_file=args.filter_file,
                 history_file=history_file,
                 history_now=history_now,
@@ -354,7 +364,12 @@ def main(
         else:
             parser.print_help(file=sys.stderr)
             raise SystemExit(2)
-    except (FilterConfigError, RecommendationHistoryError, SelectionError) as error:
+    except (
+        FilterConfigError,
+        OnboardingError,
+        RecommendationHistoryError,
+        SelectionError,
+    ) as error:
         print(f"Error: {error}", file=sys.stderr)
         raise SystemExit(2)
 

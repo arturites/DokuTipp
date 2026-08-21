@@ -3,12 +3,21 @@
 from __future__ import annotations
 
 import json
+import lzma
 import os
 import sysconfig
+import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional, TextIO
+from typing import Callable, Mapping, Optional, Sequence, TextIO, Tuple
 
-from .paths import config_file as default_config_file, data_directory
+from .filmliste import FilmlisteError, ensure_filmliste
+from .parser import FilterConfigError, available_channels, load_sender_filters
+from .paths import (
+    config_file as default_config_file,
+    data_directory,
+    sender_filter_file as default_sender_filter_file,
+)
 
 
 PROFILE_FILENAME = "PROFILE.md"
@@ -22,6 +31,19 @@ AVOID_PROMPT = (
     "Which topics would you like to avoid? "
     "Enter them comma-separated on one line (optional): "
 )
+
+
+@dataclass(frozen=True)
+class AppConfig:
+    """Validated per-user runtime and skill configuration."""
+
+    skill_root: Path
+    sender_filter_file: Optional[Path] = None
+
+
+SenderSelector = Callable[
+    [Sequence[str], Sequence[str]], Optional[Sequence[str]]
+]
 
 
 PROFILE_TEMPLATE = """# Personal Profile
@@ -187,7 +209,8 @@ def _skill_directory(skill_root: Path) -> Path:
     return directory
 
 
-def _load_config(config_file: Path) -> Optional[Path]:
+def load_config(config_file: Path) -> Optional[AppConfig]:
+    """Read and validate DokuTipp's per-user config."""
     if config_file.is_symlink():
         raise OnboardingError(f"DokuTipp config must not be a symbolic link: {config_file}")
     if not config_file.exists():
@@ -209,17 +232,36 @@ def _load_config(config_file: Path) -> Optional[Path]:
     root = Path(skill_root).expanduser()
     if not root.is_absolute():
         raise OnboardingError(f"DokuTipp config has no absolute skill root: {config_file}")
-    return root
+    if "sender_filter_file" not in value:
+        sender_filter = None
+    else:
+        sender_filter_value = value["sender_filter_file"]
+        if not isinstance(sender_filter_value, str) or not sender_filter_value:
+            raise OnboardingError(f"DokuTipp config is invalid: {config_file}")
+        sender_filter = Path(sender_filter_value).expanduser()
+        if not sender_filter.is_absolute():
+            raise OnboardingError(
+                f"DokuTipp config has no absolute sender filter path: {config_file}"
+            )
+    return AppConfig(skill_root=root, sender_filter_file=sender_filter)
 
 
-def _write_config(config_file: Path, skill_root: Path) -> None:
+def _write_config(
+    config_file: Path,
+    skill_root: Path,
+    sender_filter_file: Path,
+) -> None:
     if config_file.is_symlink():
         raise OnboardingError(f"DokuTipp config must not be a symbolic link: {config_file}")
     try:
         config_file.parent.mkdir(parents=True, exist_ok=True)
         config_file.write_text(
             json.dumps(
-                {"agent": "hermes", "skill_root": str(skill_root)},
+                {
+                    "agent": "hermes",
+                    "skill_root": str(skill_root),
+                    "sender_filter_file": str(sender_filter_file),
+                },
                 ensure_ascii=False,
                 indent=2,
             )
@@ -230,6 +272,246 @@ def _write_config(config_file: Path, skill_root: Path) -> None:
         raise OnboardingError(
             f"Could not save DokuTipp config {config_file}: {error}"
         ) from error
+
+
+def _sender_key(sender: object) -> str:
+    return str(sender).strip().casefold()
+
+
+def _deduplicate_senders(senders: Sequence[str]) -> Tuple[str, ...]:
+    values = []
+    seen = set()
+    for value in senders:
+        sender = str(value).strip()
+        key = _sender_key(sender)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        values.append(sender)
+    return tuple(values)
+
+
+def _write_sender_filters(filter_file: Path, senders: Sequence[str]) -> None:
+    if filter_file.is_symlink():
+        raise OnboardingError(
+            f"Sender filter file must not be a symbolic link: {filter_file}"
+        )
+    if filter_file.exists() and not filter_file.is_file():
+        raise OnboardingError(
+            f"Sender filter path is not a regular file: {filter_file}"
+        )
+    try:
+        filter_file.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as error:
+        raise OnboardingError(
+            f"Could not create sender filter directory {filter_file.parent}: {error}"
+        ) from error
+
+    temporary_path: Optional[Path] = None
+    try:
+        descriptor, temporary_name = tempfile.mkstemp(
+            prefix=f".{filter_file.name}.",
+            suffix=".tmp",
+            dir=filter_file.parent,
+        )
+        temporary_path = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            for sender in _deduplicate_senders(senders):
+                handle.write(f"{sender}\n")
+        os.replace(temporary_path, filter_file)
+        temporary_path = None
+    except OSError as error:
+        raise OnboardingError(
+            f"Could not save sender filter file {filter_file}: {error}"
+        ) from error
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+
+def _validate_sender_filter_path(filter_file: Path) -> None:
+    if filter_file.is_symlink():
+        raise OnboardingError(
+            f"Sender filter file must not be a symbolic link: {filter_file}"
+        )
+    if filter_file.exists() and not filter_file.is_file():
+        raise OnboardingError(
+            f"Sender filter path is not a regular file: {filter_file}"
+        )
+
+
+def _ensure_sender_filter_file(filter_file: Path, output_stream: TextIO) -> None:
+    _validate_sender_filter_path(filter_file)
+    if not filter_file.exists():
+        _write_sender_filters(filter_file, ())
+        output_stream.write(f"Created empty sender filter file at {filter_file}.\n")
+        return
+    try:
+        load_sender_filters(filter_file)
+    except FilterConfigError as error:
+        _write_sender_filters(filter_file, ())
+        output_stream.write(
+            f"Warning: {error} Recreated the sender filter file empty.\n"
+        )
+
+
+def _sender_filters_for_setup(
+    filter_file: Path,
+    output_stream: TextIO,
+) -> Tuple[str, ...]:
+    _validate_sender_filter_path(filter_file)
+    if not filter_file.exists():
+        return ()
+    try:
+        return load_sender_filters(filter_file)
+    except FilterConfigError as error:
+        output_stream.write(
+            f"Warning: {error} The file will be recreated if setup completes.\n"
+        )
+        return ()
+
+
+def _setup_sender_catalog(data_dir: Path, output_stream: TextIO) -> Tuple[str, ...]:
+    validated_channels: Tuple[str, ...] = ()
+
+    def validate(filmliste: Path) -> bool:
+        nonlocal validated_channels
+        try:
+            channels = available_channels(filmliste)
+        except (
+            OSError,
+            EOFError,
+            UnicodeError,
+            ValueError,
+            IndexError,
+            TypeError,
+            lzma.LZMAError,
+        ):
+            return False
+        if not channels:
+            return False
+        validated_channels = channels
+        return True
+
+    def setup_log(message: str) -> None:
+        output_stream.write(f"{message}\n")
+        output_stream.flush()
+
+    try:
+        ensure_filmliste(
+            data_dir,
+            allow_stale=True,
+            validate_existing=True,
+            log=setup_log,
+            validator=validate,
+        )
+    except FilmlisteError as error:
+        raise OnboardingError(
+            f"Could not prepare the broadcaster selection: {error}"
+        ) from error
+    return validated_channels
+
+
+def _merge_sender_catalog(
+    channels: Sequence[str],
+    existing_exclusions: Sequence[str],
+) -> Tuple[str, ...]:
+    catalog = {}
+    for sender in (*channels, *existing_exclusions):
+        value = str(sender).strip()
+        key = _sender_key(value)
+        if key and key not in catalog:
+            catalog[key] = value
+    return tuple(sorted(catalog.values(), key=_sender_key))
+
+
+def _questionary_sender_selector(
+    channels: Sequence[str],
+    default_allowed: Sequence[str],
+    *,
+    input_stream: TextIO,
+    output_stream: TextIO,
+) -> Optional[Sequence[str]]:
+    try:
+        import questionary
+        from prompt_toolkit.application import create_app_session
+        from prompt_toolkit.input.defaults import create_input
+        from prompt_toolkit.output.defaults import create_output
+        from questionary.prompts import common as questionary_common
+    except ImportError as error:
+        raise OnboardingError(
+            "The interactive sender selection is unavailable. Reinstall DokuTipp."
+        ) from error
+
+    allowed_keys = {_sender_key(sender) for sender in default_allowed}
+    choices = [
+        questionary.Choice(sender, checked=_sender_key(sender) in allowed_keys)
+        for sender in channels
+    ]
+    # Questionary 2.x does not expose its checkbox indicators as prompt options.
+    # Keep the display override scoped to this dialog and restore it afterwards.
+    previous_selected_indicator = questionary_common.INDICATOR_SELECTED
+    previous_unselected_indicator = questionary_common.INDICATOR_UNSELECTED
+    try:
+        questionary_common.INDICATOR_SELECTED = "- [x]"
+        questionary_common.INDICATOR_UNSELECTED = "- [ ]"
+        try:
+            with create_app_session(
+                input=create_input(stdin=input_stream),
+                output=create_output(stdout=output_stream),
+            ):
+                return questionary.checkbox(
+                    "Which broadcasters should DokuTipp include?",
+                    choices=choices,
+                    style=questionary.Style([("selected", "noreverse")]),
+                    instruction=(
+                        "Use arrow keys to move, space to toggle, and enter to "
+                        "confirm. - [x] means included; - [ ] means excluded."
+                    ),
+                ).ask()
+        finally:
+            questionary_common.INDICATOR_SELECTED = previous_selected_indicator
+            questionary_common.INDICATOR_UNSELECTED = previous_unselected_indicator
+    except (EOFError, KeyboardInterrupt) as error:
+        raise OnboardingError("DokuTipp setup was cancelled.") from error
+
+
+def _choose_sender_exclusions(
+    catalog: Sequence[str],
+    existing_exclusions: Sequence[str],
+    *,
+    input_stream: TextIO,
+    output_stream: TextIO,
+    sender_selector: Optional[SenderSelector],
+) -> Tuple[str, ...]:
+    excluded_keys = {_sender_key(sender) for sender in existing_exclusions}
+    default_allowed = [
+        sender for sender in catalog if _sender_key(sender) not in excluded_keys
+    ]
+    if sender_selector is None:
+        allowed = _questionary_sender_selector(
+            catalog,
+            default_allowed,
+            input_stream=input_stream,
+            output_stream=output_stream,
+        )
+    else:
+        allowed = sender_selector(catalog, default_allowed)
+    if allowed is None:
+        raise OnboardingError("DokuTipp setup was cancelled.")
+
+    catalog_keys = {_sender_key(sender) for sender in catalog}
+    allowed_keys = {_sender_key(sender) for sender in allowed}
+    if not allowed_keys <= catalog_keys:
+        raise OnboardingError("The sender selection returned an unknown broadcaster.")
+    return tuple(
+        sender for sender in catalog if _sender_key(sender) not in allowed_keys
+    )
 
 
 def _ensure_data_directory(data_dir: Path) -> None:
@@ -355,6 +637,7 @@ def run_setup(
     canonical_skill_file: Optional[Path] = None,
     environment: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
+    sender_selector: Optional[SenderSelector] = None,
 ) -> Path:
     """Interactively choose a skill root and install or reconfigure DokuTipp."""
     if input_stream is None:
@@ -372,6 +655,16 @@ def run_setup(
 
     _require_interactive(input_stream)
     output_stream.write("Welcome to DokuTipp. Let's set up your profile.\n")
+    existing_config = load_config(config_file)
+    sender_filter = (
+        existing_config.sender_filter_file
+        if existing_config is not None
+        and existing_config.sender_filter_file is not None
+        else _normalise_root(default_sender_filter_file(home))
+    )
+    existing_exclusions = _sender_filters_for_setup(sender_filter, output_stream)
+    current_channels = _setup_sender_catalog(data_dir, output_stream)
+    sender_catalog = _merge_sender_catalog(current_channels, existing_exclusions)
     interests = _prompt_required(
         input_stream,
         output_stream,
@@ -387,6 +680,13 @@ def run_setup(
         input_stream,
         output_stream,
         AVOID_PROMPT,
+    )
+    excluded_channels = _choose_sender_exclusions(
+        sender_catalog,
+        existing_exclusions,
+        input_stream=input_stream,
+        output_stream=output_stream,
+        sender_selector=sender_selector,
     )
 
     skill_directory = _skill_directory(skill_root)
@@ -406,7 +706,8 @@ def run_setup(
         replace_existing=True,
     )
     _ensure_data_directory(data_dir)
-    _write_config(config_file, skill_root)
+    _write_sender_filters(sender_filter, excluded_channels)
+    _write_config(config_file, skill_root, sender_filter)
     output_stream.write("DokuTipp setup is complete.\n")
     return skill_root
 
@@ -420,6 +721,7 @@ def ensure_installation(
     canonical_skill_file: Optional[Path] = None,
     environment: Optional[Mapping[str, str]] = None,
     home: Optional[Path] = None,
+    sender_selector: Optional[SenderSelector] = None,
 ) -> bool:
     """Ensure the configured skill is available; return whether setup just ran."""
     if input_stream is None:
@@ -435,8 +737,8 @@ def ensure_installation(
     if data_dir is None:
         data_dir = data_directory(home)
 
-    skill_root = _load_config(config_file)
-    if skill_root is None:
+    app_config = load_config(config_file)
+    if app_config is None:
         run_setup(
             config_file=config_file,
             data_dir=data_dir,
@@ -445,10 +747,14 @@ def ensure_installation(
             canonical_skill_file=canonical_skill_file,
             environment=environment,
             home=home,
+            sender_selector=sender_selector,
         )
         return True
 
+    skill_root = app_config.skill_root
     _ensure_data_directory(data_dir)
+    if app_config.sender_filter_file is not None:
+        _ensure_sender_filter_file(app_config.sender_filter_file, output_stream)
     skill_directory = _skill_directory(skill_root)
     skill_bytes = _canonical_skill_bytes(canonical_skill_file)
     _ensure_skill_file(

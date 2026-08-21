@@ -1,9 +1,12 @@
 import io
+import importlib.util
 import json
 import lzma
 import os
+import pty
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -17,7 +20,7 @@ SOURCE_ROOT = REPOSITORY_ROOT / "src"
 if str(SOURCE_ROOT) not in sys.path:
     sys.path.insert(0, str(SOURCE_ROOT))
 
-from dokutipp import cli, history, onboarding, parser, selection
+from dokutipp import cli, filmliste, history, onboarding, parser, selection
 from dokutipp.parser import FilterConfigError
 from dokutipp.rendering import format_duration, render_recommendations
 from dokutipp.selection import (
@@ -127,7 +130,7 @@ class CandidateIdTests(unittest.TestCase):
                     [first, second],
                     limit=None,
                     min_duration=42,
-                    channels=(),
+                    excluded_channels=(),
                     excluded_ids={"a" * 64},
                 )
 
@@ -349,7 +352,7 @@ class FetchPayloadTests(unittest.TestCase):
                 data_dir=data_dir,
                 limit=17,
                 min_duration=55,
-                channels=("ZDF", "ARTE.DE"),
+                excluded_channels=("WDR",),
                 filter_file=None,
                 history_file=self.history_file,
                 output=output,
@@ -360,7 +363,7 @@ class FetchPayloadTests(unittest.TestCase):
             data_dir=data_dir,
             limit=17,
             min_duration=55,
-            channels=("ZDF", "ARTE.DE"),
+            excluded_channels=("WDR",),
             filter_file=None,
         )
         self.assertEqual(payload["status"], "ready")
@@ -379,7 +382,7 @@ class FetchPayloadTests(unittest.TestCase):
             {
                 "limit": 17,
                 "min_duration": 55,
-                "channels": ["ZDF", "ARTE.DE"],
+                "excluded_channels": ["WDR"],
                 "title_exclusions": list(parser.load_title_filters()),
             },
         )
@@ -824,66 +827,112 @@ class RenderingTests(unittest.TestCase):
 class CacheTests(unittest.TestCase):
     def test_needs_download_respects_the_cache_age_threshold(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            filmliste = Path(temporary_directory) / cli.FILMLISTE_FILENAME
-            self.assertTrue(cli.needs_download(filmliste))
-            filmliste.touch()
-            modified_at = filmliste.stat().st_mtime
+            cache = Path(temporary_directory) / cli.FILMLISTE_FILENAME
+            self.assertTrue(filmliste.needs_download(cache))
+            cache.touch()
+            modified_at = cache.stat().st_mtime
 
-            with patch.object(cli.time, "time", return_value=modified_at + 1):
-                self.assertFalse(cli.needs_download(filmliste))
-            with patch.object(
-                cli.time,
-                "time",
-                return_value=modified_at + cli.MAX_AGE_SECONDS + 1,
-            ):
-                self.assertTrue(cli.needs_download(filmliste))
+            self.assertFalse(
+                filmliste.needs_download(cache, now=modified_at + 1)
+            )
+            self.assertTrue(
+                filmliste.needs_download(
+                    cache,
+                    now=modified_at + filmliste.MAX_AGE_SECONDS + 1,
+                )
+            )
 
     def test_ensure_filmliste_uses_fresh_cache_without_curl(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             data_dir = Path(temporary_directory) / "data"
-            stderr = io.StringIO()
-            with patch.object(cli, "needs_download", return_value=False):
-                with patch.object(cli.subprocess, "run") as curl:
-                    with redirect_stderr(stderr):
-                        filmliste = cli.ensure_filmliste(data_dir)
+            data_dir.mkdir()
+            cache = data_dir / filmliste.FILMLISTE_FILENAME
+            cache.write_bytes(lzma.compress(b"{}"))
+            messages = []
+            with patch.object(filmliste.subprocess, "run") as curl:
+                result = filmliste.ensure_filmliste(data_dir, log=messages.append)
 
-        self.assertEqual(filmliste, data_dir / cli.FILMLISTE_FILENAME)
+        self.assertEqual(result, cache)
         curl.assert_not_called()
-        self.assertIn("Filmliste-akt.xz is fresh", stderr.getvalue())
+        self.assertTrue(any("Filmliste-akt.xz is fresh" in item for item in messages))
 
-    def test_ensure_filmliste_downloads_missing_or_stale_cache(self):
+    def test_ensure_filmliste_downloads_and_atomically_installs_a_valid_cache(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             data_dir = Path(temporary_directory) / "data"
-            expected_filmliste = data_dir / cli.FILMLISTE_FILENAME
-            stderr = io.StringIO()
-            with patch.object(cli, "needs_download", return_value=True):
-                with patch.object(
-                    cli.subprocess, "run", return_value=Mock(returncode=0)
-                ) as curl:
-                    with redirect_stderr(stderr):
-                        filmliste = cli.ensure_filmliste(data_dir)
+            expected_cache = data_dir / filmliste.FILMLISTE_FILENAME
+            messages = []
 
-        self.assertEqual(filmliste, expected_filmliste)
-        curl.assert_called_once_with(
-            ["curl", "-fsSL", "-o", str(expected_filmliste), cli.DOWNLOAD_URL]
-        )
-        self.assertIn("Downloading Filmliste-akt.xz", stderr.getvalue())
-        self.assertIn("Download complete", stderr.getvalue())
+            def download(command):
+                Path(command[3]).write_bytes(lzma.compress(b'{"X": []}'))
+                return Mock(returncode=0)
 
-    def test_ensure_filmliste_reports_a_failed_download(self):
+            with patch.object(filmliste.subprocess, "run", side_effect=download) as curl:
+                result = filmliste.ensure_filmliste(data_dir, log=messages.append)
+            installed_data = lzma.decompress(expected_cache.read_bytes())
+
+        self.assertEqual(result, expected_cache)
+        self.assertEqual(installed_data, b'{"X": []}')
+        command = curl.call_args.args[0]
+        self.assertEqual(command[:3], ["curl", "-fsSL", "-o"])
+        self.assertEqual(command[4], filmliste.DOWNLOAD_URL)
+        self.assertNotEqual(Path(command[3]), expected_cache)
+        self.assertTrue(any("Downloading Filmliste-akt.xz" in item for item in messages))
+        self.assertIn("Download complete.", messages)
+
+    def test_failed_refresh_uses_readable_stale_cache_without_overwriting_it(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             data_dir = Path(temporary_directory) / "data"
+            data_dir.mkdir()
+            cache = data_dir / filmliste.FILMLISTE_FILENAME
+            original = lzma.compress(b"stale but readable")
+            cache.write_bytes(original)
+            old_time = time.time() - filmliste.MAX_AGE_SECONDS - 60
+            os.utime(cache, (old_time, old_time))
+            messages = []
+            with patch.object(
+                filmliste.subprocess, "run", return_value=Mock(returncode=1)
+            ):
+                result = filmliste.ensure_filmliste(
+                    data_dir,
+                    allow_stale=True,
+                    validate_existing=True,
+                    log=messages.append,
+                )
+            result_bytes = cache.read_bytes()
+
+        self.assertEqual(result, cache)
+        self.assertEqual(result_bytes, original)
+        self.assertTrue(any("using the existing" in item for item in messages))
+
+    def test_cli_reports_a_failed_download_when_no_cache_exists(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
             stderr = io.StringIO()
-            with patch.object(cli, "needs_download", return_value=True):
-                with patch.object(
-                    cli.subprocess, "run", return_value=Mock(returncode=1)
-                ):
-                    with redirect_stderr(stderr):
-                        with self.assertRaises(SystemExit) as error:
-                            cli.ensure_filmliste(data_dir)
+            with patch.object(
+                cli,
+                "prepare_filmliste",
+                side_effect=filmliste.FilmlisteError("Download failed."),
+            ), redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as error:
+                    cli.ensure_filmliste(Path(temporary_directory) / "data")
 
         self.assertEqual(error.exception.code, 1)
-        self.assertIn("Download of Filmliste-akt.xz failed", stderr.getvalue())
+        self.assertIn("Download failed", stderr.getvalue())
+
+    def test_setup_mode_fails_without_leaving_a_cache_when_no_fallback_exists(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data_dir = Path(temporary_directory) / "data"
+            with patch.object(
+                filmliste.subprocess, "run", return_value=Mock(returncode=1)
+            ):
+                with self.assertRaises(filmliste.FilmlisteError):
+                    filmliste.ensure_filmliste(
+                        data_dir,
+                        allow_stale=True,
+                        validate_existing=True,
+                    )
+
+            self.assertFalse((data_dir / filmliste.FILMLISTE_FILENAME).exists())
+            self.assertEqual(list(data_dir.glob("*.tmp")), [])
 
 
 class CliIntegrationTests(unittest.TestCase):
@@ -891,6 +940,13 @@ class CliIntegrationTests(unittest.TestCase):
         temporary_directory = tempfile.TemporaryDirectory()
         self.addCleanup(temporary_directory.cleanup)
         self.history_file = Path(temporary_directory.name) / "recommendation-history.json"
+        config_patch = patch.object(
+            cli,
+            "load_config",
+            return_value=onboarding.AppConfig(skill_root=Path("/tmp/dokutipp-skills")),
+        )
+        config_patch.start()
+        self.addCleanup(config_patch.stop)
         self.candidates = [
             make_candidate("One", website="https://example.invalid/one"),
             make_candidate("Two", website="https://example.invalid/two"),
@@ -914,6 +970,21 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertIn("fetch", stderr.getvalue())
         self.assertIn("select", stderr.getvalue())
 
+    def test_version_does_not_require_onboarding(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+
+        with patch.object(cli, "ensure_installation") as ensure, redirect_stdout(
+            stdout
+        ), redirect_stderr(stderr):
+            with self.assertRaises(SystemExit) as error:
+                cli.main(["--version"])
+
+        self.assertEqual(error.exception.code, 0)
+        self.assertEqual(stdout.getvalue(), "dokutipp 2.1.0\n")
+        self.assertEqual(stderr.getvalue(), "")
+        ensure.assert_not_called()
+
     def test_load_candidates_reuses_the_existing_parser_filters(self):
         filmliste = Path("/tmp/Filmliste-akt.xz")
         filter_file = Path("/tmp/filters.txt")
@@ -923,7 +994,7 @@ class CliIntegrationTests(unittest.TestCase):
                     data_dir=Path("/tmp/data"),
                     limit=12,
                     min_duration=90,
-                    channels=("ZDF", "ARTE.DE"),
+                    excluded_channels=("WDR",),
                     filter_file=filter_file,
                 )
 
@@ -932,9 +1003,52 @@ class CliIntegrationTests(unittest.TestCase):
             filmliste,
             limit=12,
             min_duration=90,
-            channels=("ZDF", "ARTE.DE"),
+            excluded_channels=("WDR",),
             filter_file=filter_file,
         )
+
+    def test_cli_reloads_personal_sender_file_for_fetch_and_select(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            sender_filter = root / "senders.txt"
+            sender_filter.write_text("KiKA\n", encoding="utf-8")
+            app_config = onboarding.AppConfig(
+                skill_root=root / "skills",
+                sender_filter_file=sender_filter,
+            )
+            identifiers = [candidate_id(candidate) for candidate in self.candidates]
+            selection_argument = (
+                f"{identifiers[0]},{identifiers[1]},{identifiers[2]},"
+                f"x{identifiers[3]}"
+            )
+            fetch_output = io.StringIO()
+            select_output = io.StringIO()
+
+            with patch.object(cli, "ensure_installation", return_value=False), patch.object(
+                cli, "load_config", return_value=app_config
+            ), patch.object(
+                cli, "load_candidates", return_value=self.candidates
+            ) as load, redirect_stdout(fetch_output):
+                cli.main(
+                    ["fetch"],
+                    history_file=self.history_file,
+                    history_now=1_800_000_000.0,
+                )
+                sender_filter.write_text("ZDF\n", encoding="utf-8")
+                with redirect_stdout(select_output):
+                    cli.main(
+                        ["select", selection_argument],
+                        history_file=self.history_file,
+                        history_now=1_800_000_000.0,
+                    )
+
+        self.assertEqual(
+            json.loads(fetch_output.getvalue())["filters"]["excluded_channels"],
+            ["KiKA"],
+        )
+        self.assertEqual(load.call_args_list[0].kwargs["excluded_channels"], ("KiKA",))
+        self.assertEqual(load.call_args_list[1].kwargs["excluded_channels"], ("ZDF",))
+        self.assertTrue(select_output.getvalue().startswith("# 📺 DokuTipps der Woche"))
 
     def test_successful_select_records_all_four_ids_including_the_extra(self):
         selected_at = 1_800_000_000.0
@@ -1101,10 +1215,6 @@ class CliIntegrationTests(unittest.TestCase):
                         "4",
                         "--min-duration",
                         "42",
-                        "--channels",
-                        "ARD",
-                        "ZDF",
-                        "ARTE.DE",
                         "--filter-file",
                         str(filter_file),
                     ],
@@ -1137,10 +1247,6 @@ class CliIntegrationTests(unittest.TestCase):
                         "4",
                         "--min-duration",
                         "42",
-                        "--channels",
-                        "ARD",
-                        "ZDF",
-                        "ARTE.DE",
                         "--filter-file",
                         str(filter_file),
                     ],
@@ -1163,10 +1269,6 @@ class CliIntegrationTests(unittest.TestCase):
                         "4",
                         "--min-duration",
                         "42",
-                        "--channels",
-                        "ARD",
-                        "ZDF",
-                        "ARTE.DE",
                         "--filter-file",
                         str(filter_file),
                     ],
@@ -1312,7 +1414,7 @@ class CliIntegrationTests(unittest.TestCase):
                 filmliste,
                 limit=cli.DEFAULT_LIMIT,
                 min_duration=cli.DEFAULT_MIN_DURATION,
-                channels=parser.DEFAULT_CHANNELS,
+                excluded_channels=(),
             )
 
         self.assertEqual(
@@ -1320,7 +1422,7 @@ class CliIntegrationTests(unittest.TestCase):
             ["Eligible documentary", "Wrong channel"],
         )
 
-    def test_parser_filters_senders_when_explicitly_requested(self):
+    def test_parser_excludes_senders_when_explicitly_requested(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             filmliste = Path(temporary_directory) / cli.FILMLISTE_FILENAME
             now = int(time.time())
@@ -1332,10 +1434,66 @@ class CliIntegrationTests(unittest.TestCase):
 
             results = parser.parse_filmliste(
                 filmliste,
-                channels=("ARD",),
+                excluded_channels=("wdr",),
             )
 
         self.assertEqual([entry["title"] for entry in results], ["ARD documentary"])
+
+    def test_sender_exclusion_applies_after_delta_decoding_and_ignores_case(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache = Path(temporary_directory) / cli.FILMLISTE_FILENAME
+            now = int(time.time())
+            write_filmliste(
+                cache,
+                [
+                    make_entry("RBTV", "First RBTV documentary", "00:42:00", now),
+                    make_entry("", "Inherited RBTV documentary", "00:42:00", now),
+                    make_entry("WDR", "WDR documentary", "00:42:00", now),
+                ],
+            )
+
+            results = parser.parse_filmliste(
+                cache,
+                excluded_channels=("rbtv",),
+            )
+
+        self.assertEqual([entry["title"] for entry in results], ["WDR documentary"])
+
+    def test_sender_exclusions_are_literal_not_regular_expressions(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache = Path(temporary_directory) / cli.FILMLISTE_FILENAME
+            now = int(time.time())
+            write_filmliste(
+                cache,
+                [
+                    make_entry("ZDFneo", "ZDFneo documentary", "00:42:00", now),
+                    make_entry("ZDF.*", "Literal-name documentary", "00:42:00", now),
+                ],
+            )
+
+            results = parser.parse_filmliste(
+                cache,
+                excluded_channels=("ZDF.*",),
+            )
+
+        self.assertEqual([entry["title"] for entry in results], ["ZDFneo documentary"])
+
+    def test_available_channels_uses_all_raw_rows_and_casefolds_duplicates(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            cache = Path(temporary_directory) / cli.FILMLISTE_FILENAME
+            write_filmliste(
+                cache,
+                [
+                    make_entry("rbtv", "Old", "00:01:00", 1),
+                    make_entry("", "Inherited", "00:01:00", 1),
+                    make_entry("RBTV", "Variant", "00:01:00", 1),
+                    make_entry("ARD", "Future", "00:01:00", 9_999_999_999),
+                ],
+            )
+
+            channels = parser.available_channels(cache)
+
+        self.assertEqual(channels, ("ARD", "rbtv"))
 
     def test_default_title_filters_exclude_formats_but_preserve_documentaries(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1398,7 +1556,7 @@ class CliIntegrationTests(unittest.TestCase):
             results = parser.parse_filmliste(
                 filmliste,
                 min_duration=cli.DEFAULT_MIN_DURATION,
-                channels=parser.DEFAULT_CHANNELS,
+                excluded_channels=(),
             )
 
         self.assertEqual(
@@ -1432,7 +1590,7 @@ class CliIntegrationTests(unittest.TestCase):
             results = parser.parse_filmliste(
                 filmliste,
                 min_duration=0,
-                channels=parser.DEFAULT_CHANNELS,
+                excluded_channels=(),
                 filter_file=filter_file,
             )
 
@@ -1450,6 +1608,32 @@ class CliIntegrationTests(unittest.TestCase):
                 parser.load_title_filters(filter_file),
                 ("Mittagsmagazin",),
             )
+
+    def test_sender_filter_file_uses_literal_casefolded_unique_lines(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            filter_file = Path(temporary_directory) / "senders.txt"
+            filter_file.write_text(
+                "\n# personal exclusions\nKiKA\nkika\nZDF.*\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                parser.load_sender_filters(filter_file),
+                ("KiKA", "ZDF.*"),
+            )
+
+    def test_direct_parser_replaces_channels_with_sender_filter_file(self):
+        argument_parser = parser.build_argument_parser()
+
+        arguments = argument_parser.parse_args(
+            ["cache.xz", "--sender-filter-file", "senders.txt"]
+        )
+
+        self.assertEqual(arguments.sender_filter_file, Path("senders.txt"))
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            argument_parser.parse_args(["cache.xz", "--channels", "ARD"])
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            cli.build_argument_parser().parse_args(["fetch", "--channels", "ARD"])
 
     def test_invalid_filter_regex_includes_file_and_line(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1475,6 +1659,20 @@ class CliIntegrationTests(unittest.TestCase):
 class OnboardingTests(unittest.TestCase):
     def setUp(self):
         self.canonical_skill = REPOSITORY_ROOT / "SKILL.md"
+        self.catalog_patch = patch.object(
+            onboarding,
+            "_setup_sender_catalog",
+            return_value=("ARD", "KiKA", "ZDF"),
+        )
+        self.selector_patch = patch.object(
+            onboarding,
+            "_questionary_sender_selector",
+            side_effect=lambda _channels, default_allowed, **_kwargs: default_allowed,
+        )
+        self.catalog_patch.start()
+        self.selector_patch.start()
+        self.addCleanup(self.catalog_patch.stop)
+        self.addCleanup(self.selector_patch.stop)
 
     def write_config(self, config_file, skill_root):
         config_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1556,11 +1754,15 @@ class OnboardingTests(unittest.TestCase):
             self.assertEqual(stdout.getvalue(), "")
             self.assertTrue((home / ".dokutipp" / "data").is_dir())
             self.assertFalse((home / ".dokutipp" / "filters.txt").exists())
+            sender_filter_file = home / ".dokutipp" / "senders.txt"
+            self.assertTrue(sender_filter_file.is_file())
+            self.assertEqual(sender_filter_file.read_text(encoding="utf-8"), "")
             self.assertEqual(
                 json.loads(config_file.read_text(encoding="utf-8")),
                 {
                     "agent": "hermes",
                     "skill_root": str((hermes_home / "skills").resolve()),
+                    "sender_filter_file": str(sender_filter_file.resolve()),
                 },
             )
             self.assertEqual(
@@ -1637,6 +1839,290 @@ class OnboardingTests(unittest.TestCase):
                 json.loads(config_file.read_text(encoding="utf-8"))["skill_root"],
                 str(manual_root.resolve()),
             )
+
+    def test_config_supports_legacy_and_personal_sender_filter_forms(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            config_file = root / "config.json"
+            skill_root = root / "skills"
+            self.write_config(config_file, skill_root)
+
+            legacy = onboarding.load_config(config_file)
+
+            sender_filter = root / "personal" / "senders.txt"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "agent": "hermes",
+                        "skill_root": str(skill_root),
+                        "sender_filter_file": str(sender_filter),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            configured = onboarding.load_config(config_file)
+
+            self.assertEqual(legacy, onboarding.AppConfig(skill_root=skill_root))
+            self.assertEqual(
+                configured,
+                onboarding.AppConfig(
+                    skill_root=skill_root,
+                    sender_filter_file=sender_filter,
+                ),
+            )
+
+            for invalid_value in (None, "", "relative/senders.txt", []):
+                with self.subTest(invalid_value=invalid_value):
+                    config_file.write_text(
+                        json.dumps(
+                            {
+                                "agent": "hermes",
+                                "skill_root": str(skill_root),
+                                "sender_filter_file": invalid_value,
+                            }
+                        ),
+                        encoding="utf-8",
+                    )
+                    with self.assertRaises(onboarding.OnboardingError):
+                        onboarding.load_config(config_file)
+
+    def test_preflight_recreates_a_configured_missing_sender_filter_empty(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            self.write_complete_installation(skill_root)
+            sender_filter = root / "personal" / "senders.txt"
+            config_file = root / "config.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "agent": "hermes",
+                        "skill_root": str(skill_root),
+                        "sender_filter_file": str(sender_filter),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+
+            onboarding.ensure_installation(
+                config_file=config_file,
+                data_dir=root / "data",
+                input_stream=io.StringIO(),
+                output_stream=output,
+                canonical_skill_file=self.canonical_skill,
+            )
+            saved_filter = sender_filter.read_text(encoding="utf-8")
+            output_value = output.getvalue()
+
+        self.assertEqual(saved_filter, "")
+        self.assertIn("Created empty sender filter file", output_value)
+
+    def test_preflight_refuses_a_symlinked_sender_filter(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            self.write_complete_installation(skill_root)
+            target = root / "target.txt"
+            target.write_text("KiKA\n", encoding="utf-8")
+            sender_filter = root / "senders.txt"
+            sender_filter.symlink_to(target)
+            config_file = root / "config.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "agent": "hermes",
+                        "skill_root": str(skill_root),
+                        "sender_filter_file": str(sender_filter),
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(onboarding.OnboardingError, "symbolic link"):
+                onboarding.ensure_installation(
+                    config_file=config_file,
+                    data_dir=root / "data",
+                    input_stream=io.StringIO(),
+                    output_stream=io.StringIO(),
+                    canonical_skill_file=self.canonical_skill,
+                )
+
+            self.assertEqual(target.read_text(encoding="utf-8"), "KiKA\n")
+
+    def test_preflight_recreates_an_invalid_utf8_sender_filter_empty(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            self.write_complete_installation(skill_root)
+            sender_filter = root / "senders.txt"
+            sender_filter.write_bytes(b"\xff\xfe")
+            config_file = root / "config.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "agent": "hermes",
+                        "skill_root": str(skill_root),
+                        "sender_filter_file": str(sender_filter),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+
+            onboarding.ensure_installation(
+                config_file=config_file,
+                data_dir=root / "data",
+                input_stream=io.StringIO(),
+                output_stream=output,
+                canonical_skill_file=self.canonical_skill,
+            )
+
+            self.assertEqual(sender_filter.read_text(encoding="utf-8"), "")
+            self.assertIn("Recreated the sender filter file empty", output.getvalue())
+
+    def test_setup_preserves_unknown_senders_and_writes_unchecked_choices(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            skill_directory = self.write_complete_installation(skill_root)
+            sender_filter = root / "personal" / "senders.txt"
+            sender_filter.parent.mkdir()
+            sender_filter.write_text("KiKA\nRetired TV\n", encoding="utf-8")
+            config_file = root / "config.json"
+            config_file.write_text(
+                json.dumps(
+                    {
+                        "agent": "hermes",
+                        "skill_root": str(skill_root),
+                        "sender_filter_file": str(sender_filter),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            captured = {}
+
+            def choose(channels, default_allowed):
+                captured["channels"] = tuple(channels)
+                captured["default_allowed"] = tuple(default_allowed)
+                return ("ARD", "Retired TV")
+
+            cli.main(
+                ["setup"],
+                config_file=config_file,
+                data_dir=root / "data",
+                home=root / "home",
+                input_stream=InteractiveInput(
+                    "science\n2\n" + str(skill_root) + "\nwar\nn\n"
+                ),
+                onboarding_output=io.StringIO(),
+                canonical_skill_file=self.canonical_skill,
+                sender_selector=choose,
+            )
+
+            saved_config = json.loads(config_file.read_text(encoding="utf-8"))
+            saved_filters = sender_filter.read_text(encoding="utf-8").splitlines()
+            profile_exists = (skill_directory / "PROFILE.md").is_file()
+
+        self.assertEqual(
+            captured["channels"],
+            ("ARD", "KiKA", "Retired TV", "ZDF"),
+        )
+        self.assertEqual(captured["default_allowed"], ("ARD", "ZDF"))
+        self.assertEqual(saved_filters, ["KiKA", "ZDF"])
+        self.assertEqual(saved_config["sender_filter_file"], str(sender_filter))
+        self.assertTrue(profile_exists)
+
+    def test_cancelled_sender_selection_leaves_personal_files_unchanged(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            home = root / "home"
+            config_file = home / ".dokutipp" / "config.json"
+            skill_root = root / "skills"
+
+            with self.assertRaisesRegex(onboarding.OnboardingError, "cancelled"):
+                onboarding.run_setup(
+                    config_file=config_file,
+                    data_dir=home / ".dokutipp" / "data",
+                    input_stream=InteractiveInput(
+                        "history\n2\n" + str(skill_root) + "\n\n"
+                    ),
+                    output_stream=io.StringIO(),
+                    canonical_skill_file=self.canonical_skill,
+                    home=home,
+                    sender_selector=lambda _channels, _default: None,
+                )
+
+            self.assertFalse(config_file.exists())
+            self.assertFalse((home / ".dokutipp" / "senders.txt").exists())
+            self.assertFalse((skill_root / "dokutipp").exists())
+
+    def test_setup_sender_catalog_uses_a_fresh_cache_without_downloading(self):
+        self.catalog_patch.stop()
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            data_dir = Path(temporary_directory) / "data"
+            data_dir.mkdir()
+            cache = data_dir / filmliste.FILMLISTE_FILENAME
+            write_filmliste(
+                cache,
+                [
+                    make_entry("ARD", "One", "00:01:00", 1),
+                    make_entry("ZDF", "Two", "00:01:00", 1),
+                ],
+            )
+            output = io.StringIO()
+
+            with patch.object(filmliste.subprocess, "run") as download:
+                channels = onboarding._setup_sender_catalog(data_dir, output)
+
+        self.assertEqual(channels, ("ARD", "ZDF"))
+        download.assert_not_called()
+        self.assertIn("fresh, skipping download", output.getvalue())
+
+    @unittest.skipUnless(
+        importlib.util.find_spec("questionary") is not None,
+        "questionary is installed with the project dependency",
+    )
+    def test_questionary_sender_selector_toggles_with_space_and_confirms_with_enter(self):
+        self.selector_patch.stop()
+        master_descriptor, slave_descriptor = pty.openpty()
+        input_stream = os.fdopen(os.dup(slave_descriptor), "r", buffering=1)
+        output_stream = os.fdopen(os.dup(slave_descriptor), "w", buffering=1)
+
+        def send_keys():
+            time.sleep(0.05)
+            os.write(master_descriptor, b" ")
+            time.sleep(0.05)
+            os.write(master_descriptor, b"\r")
+
+        key_sender = threading.Thread(target=send_keys, daemon=True)
+        key_sender.start()
+        try:
+            selected = onboarding._questionary_sender_selector(
+                ("ARD", "ZDF"),
+                ("ARD", "ZDF"),
+                input_stream=input_stream,
+                output_stream=output_stream,
+            )
+            os.set_blocking(master_descriptor, False)
+            transcript_parts = []
+            while True:
+                try:
+                    transcript_parts.append(os.read(master_descriptor, 65_536))
+                except BlockingIOError:
+                    break
+        finally:
+            key_sender.join(timeout=1)
+            input_stream.close()
+            output_stream.close()
+            os.close(master_descriptor)
+            os.close(slave_descriptor)
+
+        self.assertEqual(selected, ["ZDF"])
+        transcript = b"".join(transcript_parts).decode("utf-8", errors="replace")
+        self.assertIn("- [x] ARD", transcript)
+        self.assertIn("- [ ] ARD", transcript)
+        self.assertNotIn("\x1b[0;7m", transcript)
 
     def test_preflight_repairs_missing_files_and_handles_modified_skill(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
