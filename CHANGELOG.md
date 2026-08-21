@@ -15,6 +15,9 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 
 ### Changed
 
+- Rework the README for first-time users by leading with DokuTipp's purpose and
+  everyday agent workflow, moving low-level CLI details into a collapsible
+  integration reference, and using agent-neutral wording.
 - Use `~/.dokutipp/config.json` and `~/.dokutipp/data/` as the default paths,
   independent of the current working directory and `XDG_CONFIG_HOME`.
 - Leave existing XDG, checkout, and working-directory state untouched instead

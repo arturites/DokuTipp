@@ -1,237 +1,161 @@
 # DokuTipp
 
-DokuTipp is a standalone command-line tool that finds current documentaries in
-the public [MediathekView](https://mediathekview.de/) film list. An AI Agent chooses
-only candidate IDs; DokuTipp validates that selection and renders the complete,
-readable result itself. People and agents can use the final output directly.
+DokuTipp helps you discover current documentaries from German public-media
+libraries without searching each Mediathek yourself.
 
-## Why I started it
+You tell *DokuTipp* which topics interest you. Then it finds suitable
+programmes in the public [MediathekView](https://mediathekview.de/) film list,
+and your preferred AI agent chooses four of them:
 
-I started DokuTipp because I kept spending too much time searching several
-Mediatheken for thoughtful documentaries, reports, and deep dives. I wanted a
-small, reproducible way to surface recent candidates first and make the actual
-choice easier.
+- three recommendations based on your interests;
+- one extra recommendation outside your usual interests, to help you discover
+  something new.
 
-## MediathekView disclaimer
+The result is a readable list with titles, descriptions, dates, durations,
+broadcasters, and links to the programmes. Recommendations are remembered for
+seven days so that the same programme is not immediately suggested again.
 
-DokuTipp is an independent project. It is not affiliated with, endorsed by, or
-working with MediathekView; it only uses MediathekView's publicly accessible
-film-list data.
+## Who is it for?
+
+DokuTipp is useful if you like documentaries, reports, and in-depth programmes
+but do not want to browse several Mediatheken manually.
+
+It is a command-line tool, but you normally do not need to operate its commands
+yourself. After installation and a one-time setup, your preferred AI agent uses
+DokuTipp for you.
 
 ## Installation
 
-DokuTipp requires Python 3.9 or newer and `curl` on `PATH`.
+DokuTipp requires macOS or Linux, Python 3.9 or newer, and `curl`.
 
-### Recommended: install the checkout with pipx
-
-Use pipx if `dokutipp` should be available from every terminal without manual
-environment activation:
+The easiest way to install it is with
+[pipx](https://pipx.pypa.io/stable/installation/). pipx keeps DokuTipp separate
+from your other Python software and makes the `dokutipp` command available in
+every terminal.
 
 ```bash
-pipx install https://github.com/arturites/DokuTipp.git
+pipx install git+https://github.com/arturites/DokuTipp.git
 ```
 
-If you want to update to a newer version use:
+Check the installation:
+
+```bash
+dokutipp
+```
+
+The first run starts the setup automatically.
+
+<details>
+<summary>Alternative: install a downloaded checkout</summary>
+
+Use this option if you want to inspect or modify DokuTipp itself:
+
+```bash
+git clone https://github.com/arturites/DokuTipp.git
+cd DokuTipp
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip setuptools
+python -m pip install -e .
+dokutipp
+```
+
+After opening a new terminal, return to the checkout and activate the
+environment again:
+
+```bash
+cd /path/to/DokuTipp
+source .venv/bin/activate
+```
+
+Run `deactivate` when you want to leave the environment.
+
+</details>
+
+## First-time setup
+
+DokuTipp asks you for:
+
+1. documentary topics that interest you, entered comma-separated on one line,
+   for example `history, science, nature`;
+2. where your preferred AI agent loads its skills from;
+3. optional topics you do not want recommended.
+
+You can accept the suggested skill location or enter another one. If you choose
+a different location, your AI agent must already know that directory as a
+skill directory.
+
+DokuTipp saves an editable `PROFILE.md` in the installed skill folder. You can
+change your interests and excluded topics in that file at any time. Run
+`dokutipp setup` if you want to repeat the setup or choose a different skill
+location.
+
+## Getting recommendations
+
+After setup, ask your agent in natural language, for example:
+
+> Use DokuTipp to recommend some current documentaries.
+
+The agent reads your profile, asks DokuTipp for current candidates, and returns
+the finished recommendations. DokuTipp automatically downloads the current
+film list when needed and takes care of filtering, links, formatting, and
+recently recommended programmes.
+
+## Updating and troubleshooting
+
+Update a pipx installation with:
 
 ```bash
 pipx upgrade dokutipp
 ```
 
-### Alternative: install from a checkout in a virtual environment
-
-The following steps work on macOS and Linux and keep DokuTipp's Python
-dependencies separate from the rest of the system:
+If your terminal cannot find the command, check whether pipx installed it and
+whether it is on your `PATH`:
 
 ```bash
-git clone https://github.com/arturites/DokuTipp.git
-cd DokuTipp
-
-python3 --version
-curl --version
-
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install --upgrade pip setuptools
-python -m pip install -e .
-
-dokutipp
+pipx list
+command -v dokutipp
 ```
 
-`-e` installs the checkout in editable mode, so changes to the source are used
-immediately. The first `dokutipp` invocation starts the interactive setup
-described below. After opening a new terminal, activate the environment again
-before using the command:
+Run `pipx ensurepath` if pipx reports that its application directory is not on
+your `PATH`, then open a new terminal.
 
-```bash
-cd /path/to/DokuTipp
-source .venv/bin/activate
-dokutipp --help
-```
+Use `dokutipp --help` to see the available commands and filters.
 
-Use `deactivate` to leave the virtual environment.
+<details>
+<summary>CLI reference for agent integrations</summary>
 
-## First start and skill setup
+DokuTipp deliberately separates editorial selection from reliable output:
 
-On the first interactive `dokutipp` invocation, DokuTipp asks for your
-interests, the agent setup to use, and optional topics to avoid. It then saves
-the setup at `~/.dokutipp/config.json` and creates the empty data directory at
-`~/.dokutipp/data/`.
+1. `dokutipp fetch [filters]` returns current candidates as JSON.
+2. The agent chooses exactly three normal candidate IDs and one extra ID.
+3. `dokutipp select "ID1,ID2,ID3,xID4" [same filters]` validates the choice and
+   returns the complete recommendation list as Markdown.
 
-The new per-user state is independent of the current working directory:
+The lowercase `x` marks the extra recommendation. The agent must use complete
+IDs from the preceding `fetch` result and repeat the same filters for `select`.
+DokuTipp owns the final text and formatting; the agent forwards that output
+unchanged.
 
-```text
-~/.dokutipp/
-├── config.json
-└── data/
-    ├── Filmliste-akt.xz
-    └── recommendation-history.json
-```
+Both commands support these filters:
 
-Existing installations are intentionally not migrated. The former
-`$XDG_CONFIG_HOME/dokutipp/config.json` (or `~/.config/dokutipp/config.json`)
-and old checkout or working-directory `data/` folders remain untouched. The
-first command after this change runs onboarding again and starts with a fresh
-cache and recommendation history.
-
-At present, Hermes Agent is the supported agent choice. Its skill root is
-`${HERMES_HOME:-~/.hermes}/skills`, so DokuTipp creates:
-
-```text
-${HERMES_HOME:-~/.hermes}/skills/dokutipp/
-├── SKILL.md
-└── PROFILE.md
-```
-
-You can instead enter a skill root manually. For a new root, DokuTipp creates
-the `dokutipp` folder below it, copies its original `SKILL.md` there, and
-creates the sibling `PROFILE.md` with the answers from onboarding. At an
-existing root it checks those files and asks before replacing an existing
-profile or a modified skill.
-
-A manually chosen root must already be scanned by Hermes. DokuTipp does not
-modify Hermes configuration or register external skill directories.
-
-`PROFILE.md` is your editable personal context: change interests or topics to
-avoid directly in that file whenever they change. The CLI does not overwrite an
-existing profile during its normal checks. Run `dokutipp setup` to choose a new
-skill root; it asks before replacing an existing profile.
-
-Before every normal command, including `fetch`, `select`, and help, DokuTipp
-checks that both files are present. `dokutipp setup` performs that setup itself
-so it can deliberately reconfigure an existing installation. The preflight
-restores a missing `SKILL.md` from the bundled original and asks to recreate a
-missing profile. If the installed `SKILL.md` differs from the bundled original,
-it asks whether it should restore the original. This leaves a declined local
-edit intact. A command that needs setup or an answer cannot run
-non-interactively: it exits with status 2 without writing a command result to
-stdout.
-
-## Fetch and select
-
-DokuTipp has an explicit two-step workflow:
-
-```
-MediathekView data -> DokuTipp filtering -> LLM ID selection
--> DokuTipp validation and rendering -> final output on stdout
-```
-
-1. `dokutipp fetch [filters]` writes a machine-readable candidate set with
-   stable IDs to stdout.
-2. The AI Agent uses that candidate set and any profile context to select IDs only:
-   three normal recommendations and one extra recommendation.
-3. `dokutipp select IDS [same filters]` validates the selection, resolves the
-   IDs to the original MediathekView records, and writes the final DokuTipp
-   Markdown to stdout.
-
-DokuTipp does not configure or invoke an LLM. The LLM has no responsibility for
-headings, numbering, metadata, descriptions, links, labels, or any other
-presentation logic.
-
-### Fetch candidates
-
-```bash
-dokutipp fetch
-```
-
-`fetch` returns JSON with the filtered candidates, their IDs, the active
-filters, and a `status` field. Select candidates only when `status` is
-`"ready"`. `"no_candidates"` and `"insufficient_candidates"` mean that no
-3+1 selection is possible; their `message` field is already generated by
-DokuTipp. The active title patterns are listed in the
-`filters.title_exclusions` field.
-
-Each candidate contains its ID, title, broadcaster, date, duration, and source
-description. The Mediathek URL is deliberately not part of the `fetch` payload;
-DokuTipp resolves it from the original data during `select`. IDs are full
-SHA-256 hashes of the candidate's title, duration, broadcaster, date, and URL.
-
-After each successful `select`, DokuTipp stores all four selected hashes,
-including the extra recommendation, with their timestamps in the local
-`~/.dokutipp/data/recommendation-history.json`. Subsequent `fetch` calls omit exact hash
-matches for seven days (7 x 24 hours). Expired entries are removed on the next
-history access, so those candidates can be recommended again without a manual
-reset. A damaged local history is reset automatically with a warning on stderr.
-The history contains only hashes and timestamps. If any identity field used by
-the hash changes, the source record receives a different ID and is not
-suppressed by the earlier history entry.
-
-### Submit a selection
-
-Pass exactly four complete candidate IDs from the preceding `fetch` result as
-one comma-separated argument. Prefix exactly one ID with a lowercase `x` to
-mark the extra recommendation. The three unprefixed IDs retain their supplied
-order in the normal recommendations.
-
-```bash
-dokutipp select "ID1,ID2,ID3,xID4"
-```
-
-Candidate IDs are full lowercase SHA-256 hashes. They are valid only for the
-matching candidate set. Repeat the exact same filter arguments from `fetch`
-when running `select`, including `--filter-file` when you use a custom list:
-
-```bash
-dokutipp fetch --limit 50 --min-duration 60 --channels ARD ZDF \
-  --filter-file filters.txt
-dokutipp select "ID1,ID2,ID3,xID4" --limit 50 --min-duration 60 \
-  --channels ARD ZDF --filter-file filters.txt
-```
-
-The `select` stdout is the complete final DokuTipp Markdown. Progress and error
-messages go to stderr. After setup, `dokutipp` without a subcommand prints help
-to stderr and exits with status 2; the first bare invocation performs setup and
-exits successfully.
-
-### Filters
-
-The following options are available on both `fetch` and `select`:
-
-| Option | Default | Description |
+| Option | Default | Purpose |
 | --- | --- | --- |
-| `--limit N` | no limit | Maximum number of filtered source candidates. |
-| `--min-duration MINUTES` | `42` | Exclude entries shorter than this duration. |
-| `--channels CHANNEL [CHANNEL ...]` | all channels | Broadcasters to include. |
-| `--filter-file PATH` | `filters.txt` | File with title-exclusion regular expressions. |
+| `--limit N` | no limit | Limit the number of candidates. |
+| `--min-duration MINUTES` | `42` | Exclude shorter programmes. |
+| `--channels CHANNEL ...` | all channels | Include only selected broadcasters. |
+| `--filter-file PATH` | bundled `filters.txt` | Use another title-exclusion list. |
 
-The default `filters.txt` is stored in the repository root and is bundled for
-installed CLI builds. It contains one case-insensitive regular expression per
-line. Empty lines and lines beginning with `#` are ignored; patterns are
-matched only against programme titles. Add a new title pattern to this file,
-or pass another file with `--filter-file` to both `fetch` and `select`.
+The bundled `filters.txt` contains case-insensitive regular expressions, one
+per line. Blank lines and lines beginning with `#` are ignored.
 
-The default filter uses a 24-hour cache at
-`~/.dokutipp/data/Filmliste-akt.xz`, downloads the list when necessary,
-considers entries from all broadcasters from the past seven days, and excludes
-future entries and titles matching the patterns listed in `filters.txt`. The
-`filters.txt` lookup and packaging remain unchanged. Pass `--channels` to
-restrict the broadcaster selection.
+</details>
 
-## Skill integration
+## About the data source
 
-The installed `dokutipp/SKILL.md` is a thin agent integration layer. It tells
-the agent to read its sibling `PROFILE.md`, make the Fetch/Select ID choice,
-and forward the final `select` stdout unchanged. DokuTipp owns all final
-presentation; agents must not add their own formatting.
+DokuTipp is an independent project. It is not affiliated with, endorsed by, or
+working with MediathekView. It only uses MediathekView's publicly accessible
+film-list data.
 
 ## License
 
