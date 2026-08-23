@@ -5,6 +5,25 @@ All notable changes to DokuTipp are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add deterministic, stateless candidate pagination to `fetch` and `select`.
+  `--limit` defaults to 50 and `--page` defaults to 1; fetch responses expose
+  the page, total page count, total candidate count, and inclusive candidate
+  range.
+
+### Changed
+
+- Build pages only after complete filtering, deduplication, and recommendation
+  history exclusion, so changing the source order does not change page
+  membership.
+- Allow one final selection to combine candidates collected across all pages
+  browsed through the supplied `--page` value.
+- Update the installed agent skill to evaluate each page and request the next
+  page itself when the current candidates are not a sufficiently good match.
+
 ## [2.1.0] - 2026-08-21
 
 ### Added

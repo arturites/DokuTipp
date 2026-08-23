@@ -128,7 +128,8 @@ class CandidateIdTests(unittest.TestCase):
             with self.assertRaisesRegex(SelectionError, "Ambiguous candidate ID"):
                 selection.build_fetch_payload(
                     [first, second],
-                    limit=None,
+                    limit=50,
+                    page=1,
                     min_duration=42,
                     excluded_channels=(),
                     excluded_ids={"a" * 64},
@@ -361,7 +362,6 @@ class FetchPayloadTests(unittest.TestCase):
 
         load.assert_called_once_with(
             data_dir=data_dir,
-            limit=17,
             min_duration=55,
             excluded_channels=("WDR",),
             filter_file=None,
@@ -381,6 +381,7 @@ class FetchPayloadTests(unittest.TestCase):
             payload["filters"],
             {
                 "limit": 17,
+                "page": 1,
                 "min_duration": 55,
                 "excluded_channels": ["WDR"],
                 "title_exclusions": list(parser.load_title_filters()),
@@ -388,16 +389,41 @@ class FetchPayloadTests(unittest.TestCase):
         )
         self.assertEqual(
             [candidate["id"] for candidate in payload["candidates"]],
-            [candidate_id(candidate) for candidate in self.candidates],
+            sorted(candidate_id(candidate) for candidate in self.candidates),
+        )
+        self.assertEqual(
+            payload["pagination"],
+            {
+                "page": 1,
+                "total_pages": 1,
+                "limit": 17,
+                "total_candidates": 4,
+                "candidate_range": {"start": 1, "end": 4},
+            },
         )
         self.assertEqual(json.loads(output.getvalue()), payload)
         self.assertNotIn("website", payload["candidates"][0])
         self.assertNotIn(self.candidates[0]["website"], output.getvalue())
 
-    def test_cli_limit_defaults_to_no_limit(self):
+    def test_cli_limit_defaults_to_fifty_and_page_defaults_to_one(self):
         arguments = cli.build_argument_parser().parse_args(["fetch"])
 
-        self.assertIsNone(arguments.limit)
+        self.assertEqual(arguments.limit, 50)
+        self.assertEqual(arguments.page, 1)
+
+        explicit = cli.build_argument_parser().parse_args(
+            ["fetch", "--limit", "12", "--page", "3"]
+        )
+        self.assertEqual(explicit.limit, 12)
+        self.assertEqual(explicit.page, 3)
+
+        for option in ("--limit", "--page"):
+            for value in ("0", "-1", "not-a-number"):
+                with self.subTest(option=option, value=value):
+                    with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+                        cli.build_argument_parser().parse_args(
+                            ["fetch", option, value]
+                        )
 
         output = io.StringIO()
         with patch.object(cli, "load_candidates", return_value=self.candidates) as load:
@@ -407,8 +433,9 @@ class FetchPayloadTests(unittest.TestCase):
                 today=date(2026, 8, 12),
             )
 
-        self.assertIsNone(load.call_args.kwargs["limit"])
-        self.assertIsNone(json.loads(output.getvalue())["filters"]["limit"])
+        self.assertNotIn("limit", load.call_args.kwargs)
+        self.assertEqual(json.loads(output.getvalue())["filters"]["limit"], 50)
+        self.assertEqual(json.loads(output.getvalue())["pagination"]["page"], 1)
 
     def test_fetch_reports_no_and_insufficient_candidates_without_urls(self):
         cases = [
@@ -456,7 +483,7 @@ class FetchPayloadTests(unittest.TestCase):
         self.assertEqual(payload["status"], "insufficient_candidates")
         self.assertEqual(
             [candidate["id"] for candidate in payload["candidates"]],
-            [candidate_id(candidate) for candidate in self.candidates[:3]],
+            sorted(candidate_id(candidate) for candidate in self.candidates[:3]),
         )
         self.assertIn("3 von 4 benötigt", payload["message"])
 
@@ -485,7 +512,7 @@ class FetchPayloadTests(unittest.TestCase):
         self.assertEqual(active_payload["status"], "insufficient_candidates")
         self.assertEqual(
             [candidate["id"] for candidate in active_payload["candidates"]],
-            identifiers[2:],
+            sorted(identifiers[2:]),
         )
         self.assertIn("3 von 4 benötigt", active_payload["message"])
         self.assertEqual(json.loads(before_expiry.getvalue()), active_payload)
@@ -504,7 +531,7 @@ class FetchPayloadTests(unittest.TestCase):
         self.assertEqual(expired_payload["status"], "ready")
         self.assertEqual(
             [candidate["id"] for candidate in expired_payload["candidates"]],
-            identifiers,
+            sorted(identifiers),
         )
 
     def test_fetch_reports_no_candidates_when_every_candidate_is_recent(self):
@@ -529,7 +556,7 @@ class FetchPayloadTests(unittest.TestCase):
         self.assertEqual(payload["candidates"], [])
         self.assertIn("Keine passenden Dokumentationen", payload["message"])
 
-    def test_recent_ids_do_not_refill_an_explicit_upstream_limit(self):
+    def test_recent_ids_are_excluded_before_page_slicing(self):
         selected_at = 1_800_000_000.0
         candidates = [
             *self.candidates,
@@ -543,7 +570,7 @@ class FetchPayloadTests(unittest.TestCase):
         )
         output = io.StringIO()
 
-        with patch.object(cli, "load_candidates", return_value=candidates[:4]) as load:
+        with patch.object(cli, "load_candidates", return_value=candidates) as load:
             payload = cli.run_fetch(
                 limit=4,
                 history_file=self.history_file,
@@ -552,12 +579,13 @@ class FetchPayloadTests(unittest.TestCase):
                 today=date(2026, 8, 12),
             )
 
-        self.assertEqual(payload["status"], "insufficient_candidates")
+        self.assertEqual(payload["status"], "ready")
         self.assertEqual(
-            [candidate["id"] for candidate in payload["candidates"]], identifiers[1:4]
+            [candidate["id"] for candidate in payload["candidates"]],
+            sorted(identifiers[1:]),
         )
-        self.assertNotIn(identifiers[4], output.getvalue())
-        self.assertEqual(load.call_args.kwargs["limit"], 4)
+        self.assertNotIn(identifiers[0], output.getvalue())
+        self.assertNotIn("limit", load.call_args.kwargs)
 
     def test_corrupted_history_warns_without_contaminating_fetch_json(self):
         self.history_file.write_text("{not valid json", encoding="utf-8")
@@ -992,7 +1020,6 @@ class CliIntegrationTests(unittest.TestCase):
             with patch.object(cli, "parse_filmliste", return_value=self.candidates) as parse:
                 result = cli.load_candidates(
                     data_dir=Path("/tmp/data"),
-                    limit=12,
                     min_duration=90,
                     excluded_channels=("WDR",),
                     filter_file=filter_file,
@@ -1001,7 +1028,6 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertIs(result, self.candidates)
         parse.assert_called_once_with(
             filmliste,
-            limit=12,
             min_duration=90,
             excluded_channels=("WDR",),
             filter_file=filter_file,
@@ -1224,13 +1250,16 @@ class CliIntegrationTests(unittest.TestCase):
                 )
 
             fetch_payload = json.loads(fetch_stdout.getvalue())
-            candidate_ids = [candidate["id"] for candidate in fetch_payload["candidates"]]
+            candidate_ids_by_title = {
+                candidate["title"]: candidate["id"]
+                for candidate in fetch_payload["candidates"]
+            }
             selection_argument = ",".join(
                 [
-                    candidate_ids[2],
-                    f"{EXTRA_ID_PREFIX}{candidate_ids[3]}",
-                    candidate_ids[0],
-                    candidate_ids[1],
+                    candidate_ids_by_title["Three"],
+                    f"{EXTRA_ID_PREFIX}{candidate_ids_by_title['Extra']}",
+                    candidate_ids_by_title["One"],
+                    candidate_ids_by_title["Two"],
                 ]
             )
 

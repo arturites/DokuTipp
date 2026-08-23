@@ -106,11 +106,12 @@ After setup, ask your agent in natural language, for example:
 
 > Use DokuTipp to recommend some current documentaries.
 
-The agent reads your profile, asks DokuTipp for current candidates, and returns
-the finished recommendations. DokuTipp automatically downloads the current
-film list when needed and takes care of filtering, links, formatting, and
-recently recommended programmes. The personal broadcaster exclusions apply
-automatically to both candidate fetching and final selection.
+The agent reads your profile, asks DokuTipp for current candidates page by
+page, and returns the finished recommendations. DokuTipp automatically
+downloads the current film list when needed and takes care of filtering, stable
+pagination, links, formatting, and recently recommended programmes. The
+personal broadcaster exclusions apply automatically to both candidate fetching
+and final selection.
 
 ## Updating and troubleshooting
 
@@ -138,13 +139,21 @@ Use `dokutipp --help` to see the available commands and filters.
 
 DokuTipp deliberately separates editorial selection from reliable output:
 
-1. `dokutipp fetch [filters]` returns current candidates as JSON.
-2. The agent chooses exactly three normal candidate IDs and one extra ID.
-3. `dokutipp select "ID1,ID2,ID3,xID4" [same filters]` validates the choice and
-   returns the complete recommendation list as Markdown.
+1. `dokutipp fetch --limit 50 --page 1 [filters]` returns one deterministic
+   candidate page as JSON.
+2. The agent keeps suitable candidates and requests further pages with the
+   same browsing parameters until it has a good selection. Candidates may
+   come from different pages.
+3. `dokutipp select "ID1,ID2,ID3,xID4" --limit 50 --page M [same filters]`
+   validates the choice against all pages through `M` and returns the complete
+   recommendation list as Markdown.
 
 The lowercase `x` marks the extra recommendation. The agent must use complete
-IDs from the preceding `fetch` result and repeat the same filters for `select`.
+IDs from the fetched pages and repeat the browsing parameters with the latest
+page reached for `select`. The fetch response includes `pagination.page`,
+`pagination.total_pages`, `pagination.total_candidates`, and the inclusive
+`candidate_range`. The page is calculated after filtering, deduplication, and
+history exclusion; DokuTipp stores no pagination state between invocations.
 DokuTipp owns the final text and formatting; the agent forwards that output
 unchanged.
 
@@ -152,7 +161,8 @@ Both commands support these filters:
 
 | Option | Default | Purpose |
 | --- | --- | --- |
-| `--limit N` | no limit | Limit the number of candidates. |
+| `--limit N` | `50` | Number of candidates shown per page. |
+| `--page N` | `1` | One-based candidate page to fetch or select. |
 | `--min-duration MINUTES` | `42` | Exclude shorter programmes. |
 | `--filter-file PATH` | bundled `filters.txt` | Use another title-exclusion list. |
 

@@ -44,16 +44,21 @@ from .rendering import (
     render_recommendations,
 )
 from .selection import (
+    PaginationError,
     SelectionError,
     TOTAL_RECOMMENDATION_COUNT,
+    build_candidate_pool,
     build_fetch_payload,
+    candidate_id,
     parse_selection_argument,
+    paginate_candidates,
     resolve_selection,
 )
 
 
 HISTORY_FILENAME = "recommendation-history.json"
-DEFAULT_LIMIT: Optional[int] = None
+DEFAULT_LIMIT = 50
+DEFAULT_PAGE = 1
 DEFAULT_MIN_DURATION = 42
 
 
@@ -93,7 +98,6 @@ def ensure_filmliste(data_dir: Path) -> Path:
 def load_candidates(
     *,
     data_dir: Optional[Path] = None,
-    limit: Optional[int] = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     excluded_channels: Sequence[str] = (),
     filter_file: Optional[Path] = None,
@@ -104,7 +108,6 @@ def load_candidates(
     filmliste = ensure_filmliste(data_dir)
     return parse_filmliste(
         filmliste,
-        limit=limit,
         min_duration=min_duration,
         excluded_channels=excluded_channels,
         filter_file=filter_file,
@@ -114,7 +117,8 @@ def load_candidates(
 def run_fetch(
     *,
     data_dir: Optional[Path] = None,
-    limit: Optional[int] = DEFAULT_LIMIT,
+    limit: int = DEFAULT_LIMIT,
+    page: int = DEFAULT_PAGE,
     min_duration: int = DEFAULT_MIN_DURATION,
     excluded_channels: Sequence[str] = (),
     filter_file: Optional[Path] = None,
@@ -131,7 +135,6 @@ def run_fetch(
 
     candidates = load_candidates(
         data_dir=data_dir,
-        limit=limit,
         min_duration=min_duration,
         excluded_channels=excluded_channels,
         filter_file=filter_file,
@@ -145,6 +148,7 @@ def run_fetch(
     payload = build_fetch_payload(
         candidates,
         limit=limit,
+        page=page,
         min_duration=min_duration,
         excluded_channels=excluded_channels,
         title_filters=title_filters,
@@ -167,7 +171,8 @@ def run_select(
     selection_argument: str,
     *,
     data_dir: Optional[Path] = None,
-    limit: Optional[int] = DEFAULT_LIMIT,
+    limit: int = DEFAULT_LIMIT,
+    page: int = DEFAULT_PAGE,
     min_duration: int = DEFAULT_MIN_DURATION,
     excluded_channels: Sequence[str] = (),
     filter_file: Optional[Path] = None,
@@ -184,12 +189,25 @@ def run_select(
 
     candidates = load_candidates(
         data_dir=data_dir,
-        limit=limit,
         min_duration=min_duration,
         excluded_channels=excluded_channels,
         filter_file=filter_file,
     )
-    selection = resolve_selection(selection_argument, candidates)
+    recent_ids = load_recent_ids(
+        default_history_file(data_dir) if history_file is None else history_file,
+        now=history_now,
+        warn=_history_warning,
+    )
+    candidate_pool = build_candidate_pool(candidates, excluded_ids=recent_ids)
+    candidate_page = paginate_candidates(candidate_pool, limit=limit, page=page)
+    browsed_candidates = tuple(
+        sorted(candidate_pool, key=candidate_id)[: candidate_page.end]
+    )
+    if len(browsed_candidates) < TOTAL_RECOMMENDATION_COUNT:
+        raise SelectionError(
+            "The browsed pages contain fewer than four selectable candidates."
+        )
+    selection = resolve_selection(selection_argument, browsed_candidates)
     rendered = render_recommendations(selection, today=today)
     recommendation_ids, extra_recommendation_id = parse_selection_argument(
         selection_argument
@@ -204,13 +222,20 @@ def run_select(
 
 
 def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the shared MediathekView filter options to one subcommand."""
+    """Add shared filter and pagination options to one subcommand."""
     parser.add_argument(
         "--limit",
-        type=int,
+        type=_positive_int,
         default=DEFAULT_LIMIT,
         metavar="N",
-        help="Maximum number of filtered source candidates (default: no limit)",
+        help="Number of candidates shown per page (default: 50)",
+    )
+    parser.add_argument(
+        "--page",
+        type=_positive_int,
+        default=DEFAULT_PAGE,
+        metavar="N",
+        help="One-based candidate page to show (default: 1)",
     )
     parser.add_argument(
         "--min-duration",
@@ -226,6 +251,37 @@ def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
         metavar="PATH",
         help="Title exclusion regex file (default: filters.txt)",
     )
+
+
+def _positive_int(value: str) -> int:
+    """Parse a strictly positive command-line integer."""
+    try:
+        parsed = int(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive integer") from error
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
+def _write_pagination_error(error: PaginationError) -> None:
+    """Write one machine-readable pagination error to stderr."""
+    json.dump(
+        {
+            "type": "error",
+            "error_code": "page_out_of_range",
+            "page": error.page,
+            "total_pages": error.total_pages,
+            "limit": error.limit,
+            "total_candidates": error.total_candidates,
+            "message": str(error),
+        },
+        sys.stderr,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    sys.stderr.write("\n")
+    sys.stderr.flush()
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -339,6 +395,7 @@ def main(
             run_fetch(
                 data_dir=effective_data_dir,
                 limit=args.limit,
+                page=args.page,
                 min_duration=args.min_duration,
                 excluded_channels=excluded_channels,
                 filter_file=args.filter_file,
@@ -350,6 +407,7 @@ def main(
                 args.ids,
                 data_dir=effective_data_dir,
                 limit=args.limit,
+                page=args.page,
                 min_duration=args.min_duration,
                 excluded_channels=excluded_channels,
                 filter_file=args.filter_file,
@@ -364,6 +422,9 @@ def main(
         else:
             parser.print_help(file=sys.stderr)
             raise SystemExit(2)
+    except PaginationError as error:
+        _write_pagination_error(error)
+        raise SystemExit(2)
     except (
         FilterConfigError,
         OnboardingError,

@@ -20,12 +20,54 @@ class SelectionError(ValueError):
     """Raised when candidate IDs or a submitted selection are unusable."""
 
 
+class PaginationError(ValueError):
+    """Raised when a requested candidate page is outside the available range."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        page: int,
+        total_pages: int,
+        limit: int,
+        total_candidates: int,
+    ) -> None:
+        super().__init__(message)
+        self.page = page
+        self.total_pages = total_pages
+        self.limit = limit
+        self.total_candidates = total_candidates
+
+
 @dataclass(frozen=True)
 class ResolvedSelection:
     """The original source records selected by the agent."""
 
     recommendations: Tuple[Mapping[str, Any], ...]
     extra_recommendation: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class CandidatePage:
+    """One deterministic, one-based page of the candidate pool."""
+
+    candidates: Tuple[Mapping[str, Any], ...]
+    page: int
+    total_pages: int
+    limit: int
+    total_candidates: int
+    start: int
+    end: int
+
+    def pagination_payload(self) -> Dict[str, Any]:
+        """Return machine-readable metadata for one page."""
+        return {
+            "page": self.page,
+            "total_pages": self.total_pages,
+            "limit": self.limit,
+            "total_candidates": self.total_candidates,
+            "candidate_range": {"start": self.start, "end": self.end},
+        }
 
 
 def candidate_id(candidate: Mapping[str, Any]) -> str:
@@ -59,10 +101,74 @@ def build_candidate_registry(
     return registry
 
 
+def paginate_candidates(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    limit: int,
+    page: int,
+) -> CandidatePage:
+    """Return a stable page after validating the requested bounds."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise SelectionError("limit must be a positive integer.")
+    if isinstance(page, bool) or not isinstance(page, int) or page <= 0:
+        raise SelectionError("page must be a positive integer.")
+
+    ordered_candidates = tuple(sorted(candidates, key=candidate_id))
+    total_candidates = len(ordered_candidates)
+    total_pages = (
+        (total_candidates + limit - 1) // limit if total_candidates else 0
+    )
+    if total_candidates == 0 and page == 1:
+        return CandidatePage(
+            candidates=(),
+            page=page,
+            total_pages=total_pages,
+            limit=limit,
+            total_candidates=total_candidates,
+            start=0,
+            end=0,
+        )
+    if page > total_pages:
+        raise PaginationError(
+            f"Page {page} is outside the available range 1..{total_pages}.",
+            page=page,
+            total_pages=total_pages,
+            limit=limit,
+            total_candidates=total_candidates,
+        )
+
+    offset = (page - 1) * limit
+    visible_candidates = ordered_candidates[offset : offset + limit]
+    return CandidatePage(
+        candidates=visible_candidates,
+        page=page,
+        total_pages=total_pages,
+        limit=limit,
+        total_candidates=total_candidates,
+        start=offset + 1,
+        end=offset + len(visible_candidates),
+    )
+
+
+def build_candidate_pool(
+    candidates: Sequence[Mapping[str, Any]],
+    *,
+    excluded_ids: AbstractSet[str] = frozenset(),
+) -> list:
+    """Return unique candidates excluding the supplied recommendation IDs."""
+    registry = build_candidate_registry(candidates)
+    return [
+        candidate
+        for identifier, candidate in registry.items()
+        if identifier not in excluded_ids
+    ]
+
+
 def build_fetch_payload(
     candidates: Sequence[Mapping[str, Any]],
     *,
-    limit: Optional[int],
+    limit: int,
+    page: int = 1,
     min_duration: int,
     excluded_channels: Sequence[str],
     title_filters: Sequence[str] = (),
@@ -75,13 +181,17 @@ def build_fetch_payload(
     source set for duplicate rows and genuine hash collisions.
     """
     registry = build_candidate_registry(candidates)
+    candidate_pool = [
+        candidate
+        for identifier, candidate in registry.items()
+        if identifier not in excluded_ids
+    ]
+    candidate_page = paginate_candidates(candidate_pool, limit=limit, page=page)
     candidate_payload = []
-    for identifier, candidate in registry.items():
-        if identifier in excluded_ids:
-            continue
+    for candidate in candidate_page.candidates:
         candidate_payload.append(
             {
-                "id": identifier,
+                "id": candidate_id(candidate),
                 "title": _text(candidate.get("title")),
                 "channel": _text(candidate.get("channel")),
                 "date": _text(candidate.get("date")),
@@ -90,7 +200,7 @@ def build_fetch_payload(
             }
         )
 
-    available = len(candidate_payload)
+    available = len(candidate_pool)
     if not available:
         status = "no_candidates"
     elif available < TOTAL_RECOMMENDATION_COUNT:
@@ -108,10 +218,12 @@ def build_fetch_payload(
         },
         "filters": {
             "limit": limit,
+            "page": page,
             "min_duration": min_duration,
             "excluded_channels": list(excluded_channels),
             "title_exclusions": list(title_filters),
         },
+        "pagination": candidate_page.pagination_payload(),
         "candidates": candidate_payload,
     }
     if status != "ready":
