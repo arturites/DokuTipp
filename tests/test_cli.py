@@ -369,23 +369,8 @@ class FetchPayloadTests(unittest.TestCase):
         self.assertEqual(payload["status"], "ready")
         self.assertNotIn("message", payload)
         self.assertEqual(
-            payload["selection"],
-            {
-                "normal_recommendations": 3,
-                "extra_recommendations": 1,
-                "extra_id_prefix": "x",
-                "argument_format": "ID1,ID2,ID3,xID4",
-            },
-        )
-        self.assertEqual(
-            payload["filters"],
-            {
-                "limit": 17,
-                "page": 1,
-                "min_duration": 55,
-                "excluded_channels": ["WDR"],
-                "title_exclusions": list(parser.load_title_filters()),
-            },
+            set(payload),
+            {"status", "pagination", "candidates"},
         )
         self.assertEqual(
             [candidate["id"] for candidate in payload["candidates"]],
@@ -434,7 +419,7 @@ class FetchPayloadTests(unittest.TestCase):
             )
 
         self.assertNotIn("limit", load.call_args.kwargs)
-        self.assertEqual(json.loads(output.getvalue())["filters"]["limit"], 50)
+        self.assertEqual(json.loads(output.getvalue())["pagination"]["limit"], 50)
         self.assertEqual(json.loads(output.getvalue())["pagination"]["page"], 1)
 
     def test_fetch_reports_no_and_insufficient_candidates_without_urls(self):
@@ -1068,10 +1053,6 @@ class CliIntegrationTests(unittest.TestCase):
                         history_now=1_800_000_000.0,
                     )
 
-        self.assertEqual(
-            json.loads(fetch_output.getvalue())["filters"]["excluded_channels"],
-            ["KiKA"],
-        )
         self.assertEqual(load.call_args_list[0].kwargs["excluded_channels"], ("KiKA",))
         self.assertEqual(load.call_args_list[1].kwargs["excluded_channels"], ("ZDF",))
         self.assertTrue(select_output.getvalue().startswith("# 📺 DokuTipps der Woche"))
@@ -1371,7 +1352,7 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(stdout.getvalue(), "")
         self.assertIn("Invalid title filter", stderr.getvalue())
 
-    def test_explicit_filter_file_is_used_for_fetch_metadata(self):
+    def test_explicit_filter_file_is_not_exposed_in_fetch_payload(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             filter_file = Path(temporary_directory) / "filters.txt"
             filter_file.write_text(
@@ -1387,7 +1368,7 @@ class CliIntegrationTests(unittest.TestCase):
                     output=output,
                 )
 
-        self.assertEqual(payload["filters"]["title_exclusions"], ["Mittags[- ]magazin"])
+        self.assertNotIn("filters", payload)
 
     def test_select_workflow_does_not_read_skill_md(self):
         identifiers = [candidate_id(candidate) for candidate in self.candidates]

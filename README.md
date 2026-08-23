@@ -169,7 +169,7 @@ Both commands support these filters:
 The bundled `filters.txt` contains case-insensitive regular expressions, one
 per line. Blank lines and lines beginning with `#` are ignored.
 Broadcaster exclusions are personal configuration and therefore have no CLI
-override. The `fetch` JSON reports them as `filters.excluded_channels`.
+override. They are applied automatically while building the candidate pool.
 
 </details>
 

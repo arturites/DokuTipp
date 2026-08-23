@@ -210,19 +210,6 @@ def build_fetch_payload(
 
     payload: Dict[str, Any] = {
         "status": status,
-        "selection": {
-            "normal_recommendations": NORMAL_RECOMMENDATION_COUNT,
-            "extra_recommendations": 1,
-            "extra_id_prefix": EXTRA_ID_PREFIX,
-            "argument_format": "ID1,ID2,ID3,xID4",
-        },
-        "filters": {
-            "limit": limit,
-            "page": page,
-            "min_duration": min_duration,
-            "excluded_channels": list(excluded_channels),
-            "title_exclusions": list(title_filters),
-        },
         "pagination": candidate_page.pagination_payload(),
         "candidates": candidate_payload,
     }

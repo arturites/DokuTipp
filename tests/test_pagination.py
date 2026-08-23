@@ -90,7 +90,7 @@ class PaginationTests(unittest.TestCase):
             },
         )
         self.assertEqual(len(payload["candidates"]), 4)
-        self.assertEqual(payload["filters"]["page"], 2)
+        self.assertEqual(payload["pagination"]["page"], 2)
         self.assertNotIn("website", json.dumps(payload))
 
     def test_last_short_page_remains_usable_for_cross_page_selection(self):

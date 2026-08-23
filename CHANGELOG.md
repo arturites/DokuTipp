@@ -21,6 +21,8 @@ and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
   membership.
 - Allow one final selection to combine candidates collected across all pages
   browsed through the supplied `--page` value.
+- Keep fetch responses focused on status, pagination, candidates, and relevant
+  error messages instead of exposing internal filter and selection metadata.
 - Update the installed agent skill to evaluate each page and request the next
   page itself when the current candidates are not a sufficiently good match.
 
