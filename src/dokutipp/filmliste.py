@@ -99,7 +99,8 @@ def ensure_filmliste(
 
         try:
             result = subprocess.run(
-                ["curl", "-fsSL", "-o", str(temporary_path), DOWNLOAD_URL]
+                ["curl", "-fsSL", "-o", str(temporary_path), DOWNLOAD_URL],
+                stderr=subprocess.PIPE,
             )
         except OSError as error:
             raise FilmlisteError(

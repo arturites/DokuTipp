@@ -4,11 +4,17 @@ import json
 import lzma
 import os
 import pty
+import random
+import select as select_module
+import shutil
+import subprocess
 import sys
 import tempfile
+import termios
 import threading
 import time
 import unittest
+import venv
 from contextlib import redirect_stderr, redirect_stdout
 from datetime import date
 from pathlib import Path
@@ -27,6 +33,7 @@ from dokutipp.selection import (
     CANDIDATE_HASH_FIELDS,
     EXTRA_ID_PREFIX,
     SelectionError,
+    build_candidate_pool,
     build_candidate_registry,
     candidate_id,
     parse_selection_argument,
@@ -39,6 +46,33 @@ class InteractiveInput(io.StringIO):
 
     def isatty(self):
         return True
+
+
+class RequestDrivenInput:
+    """Return scripted or valid selections for the latest flushed JSON request."""
+
+    VALID = object()
+    EOF = object()
+
+    def __init__(self, event_output, responses=()):
+        self.event_output = event_output
+        self.responses = list(responses)
+        self.requests = []
+
+    def readline(self):
+        request = next(
+            json.loads(line)
+            for line in reversed(self.event_output.getvalue().splitlines())
+            if json.loads(line).get("type") == "selection_request"
+        )
+        self.requests.append(request)
+        response = self.responses.pop(0) if self.responses else self.VALID
+        if response is self.EOF:
+            return ""
+        if response is not self.VALID:
+            return f"{response}\n"
+        identifiers = [candidate["id"] for candidate in request["candidates"][:4]]
+        return ",".join([*identifiers[:3], f"x{identifiers[3]}"]) + "\n"
 
 
 class CandidateIdTests(unittest.TestCase):
@@ -126,13 +160,7 @@ class CandidateIdTests(unittest.TestCase):
                 build_candidate_registry([first, second])
 
             with self.assertRaisesRegex(SelectionError, "Ambiguous candidate ID"):
-                selection.build_fetch_payload(
-                    [first, second],
-                    limit=None,
-                    min_duration=42,
-                    excluded_channels=(),
-                    excluded_ids={"a" * 64},
-                )
+                build_candidate_pool([first, second], excluded_ids={"a" * 64})
 
 
 class RecommendationHistoryTests(unittest.TestCase):
@@ -312,272 +340,6 @@ class RecommendationHistoryTests(unittest.TestCase):
         self.assertEqual(self.history_file.read_bytes(), previous_contents)
 
 
-class FetchPayloadTests(unittest.TestCase):
-    def setUp(self):
-        temporary_directory = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary_directory.cleanup)
-        self.history_file = Path(temporary_directory.name) / "recommendation-history.json"
-        self.candidates = [
-            make_candidate(
-                "One",
-                channel="ARD",
-                description="First source synopsis.",
-                website="https://example.invalid/one",
-            ),
-            make_candidate(
-                "Two",
-                channel="ZDF",
-                description="Second source synopsis.",
-                website="https://example.invalid/two",
-            ),
-            make_candidate(
-                "Three",
-                channel="ARTE.DE",
-                description="Third source synopsis.",
-                website="https://example.invalid/three",
-            ),
-            make_candidate(
-                "Extra",
-                channel="ARD",
-                description="Extra source synopsis.",
-                website="https://example.invalid/extra",
-            ),
-        ]
-
-    def test_fetch_ready_outputs_machine_readable_ids_without_urls(self):
-        output = io.StringIO()
-        data_dir = Path("/tmp/dokutipp-fetch-data")
-        with patch.object(cli, "load_candidates", return_value=self.candidates) as load:
-            payload = cli.run_fetch(
-                data_dir=data_dir,
-                limit=17,
-                min_duration=55,
-                excluded_channels=("WDR",),
-                filter_file=None,
-                history_file=self.history_file,
-                output=output,
-                today=date(2026, 8, 12),
-            )
-
-        load.assert_called_once_with(
-            data_dir=data_dir,
-            limit=17,
-            min_duration=55,
-            excluded_channels=("WDR",),
-            filter_file=None,
-        )
-        self.assertEqual(payload["status"], "ready")
-        self.assertNotIn("message", payload)
-        self.assertEqual(
-            payload["selection"],
-            {
-                "normal_recommendations": 3,
-                "extra_recommendations": 1,
-                "extra_id_prefix": "x",
-                "argument_format": "ID1,ID2,ID3,xID4",
-            },
-        )
-        self.assertEqual(
-            payload["filters"],
-            {
-                "limit": 17,
-                "min_duration": 55,
-                "excluded_channels": ["WDR"],
-                "title_exclusions": list(parser.load_title_filters()),
-            },
-        )
-        self.assertEqual(
-            [candidate["id"] for candidate in payload["candidates"]],
-            [candidate_id(candidate) for candidate in self.candidates],
-        )
-        self.assertEqual(json.loads(output.getvalue()), payload)
-        self.assertNotIn("website", payload["candidates"][0])
-        self.assertNotIn(self.candidates[0]["website"], output.getvalue())
-
-    def test_cli_limit_defaults_to_no_limit(self):
-        arguments = cli.build_argument_parser().parse_args(["fetch"])
-
-        self.assertIsNone(arguments.limit)
-
-        output = io.StringIO()
-        with patch.object(cli, "load_candidates", return_value=self.candidates) as load:
-            cli.run_fetch(
-                history_file=self.history_file,
-                output=output,
-                today=date(2026, 8, 12),
-            )
-
-        self.assertIsNone(load.call_args.kwargs["limit"])
-        self.assertIsNone(json.loads(output.getvalue())["filters"]["limit"])
-
-    def test_fetch_reports_no_and_insufficient_candidates_without_urls(self):
-        cases = [
-            ([], "no_candidates", "Keine passenden Dokumentationen"),
-            (
-                self.candidates[:3],
-                "insufficient_candidates",
-                "3 von 4 benötigt",
-            ),
-        ]
-
-        for candidates, expected_status, expected_message in cases:
-            with self.subTest(status=expected_status):
-                output = io.StringIO()
-                with patch.object(cli, "load_candidates", return_value=candidates):
-                    payload = cli.run_fetch(
-                        history_file=self.history_file,
-                        output=output,
-                        today=date(2026, 8, 12),
-                    )
-
-                self.assertEqual(payload["status"], expected_status)
-                self.assertIn(expected_message, payload["message"])
-                self.assertEqual(json.loads(output.getvalue()), payload)
-                self.assertNotIn("website", output.getvalue())
-                for candidate in candidates:
-                    self.assertNotIn(candidate["website"], output.getvalue())
-
-    def test_fetch_counts_repeated_source_rows_as_one_candidate(self):
-        candidates = [
-            self.candidates[0],
-            dict(self.candidates[0], description="Updated source synopsis."),
-            self.candidates[1],
-            self.candidates[2],
-        ]
-        output = io.StringIO()
-
-        with patch.object(cli, "load_candidates", return_value=candidates):
-            payload = cli.run_fetch(
-                history_file=self.history_file,
-                output=output,
-                today=date(2026, 8, 12),
-            )
-
-        self.assertEqual(payload["status"], "insufficient_candidates")
-        self.assertEqual(
-            [candidate["id"] for candidate in payload["candidates"]],
-            [candidate_id(candidate) for candidate in self.candidates[:3]],
-        )
-        self.assertIn("3 von 4 benötigt", payload["message"])
-
-    def test_fetch_excludes_recent_ids_and_recomputes_status_until_exact_expiry(self):
-        selected_at = 1_800_000_000.0
-        candidates = [
-            *self.candidates,
-            make_candidate("Five", website="https://example.invalid/five"),
-        ]
-        identifiers = [candidate_id(candidate) for candidate in candidates]
-        history.record_selected_ids(
-            self.history_file,
-            identifiers[:2],
-            now=selected_at,
-        )
-
-        before_expiry = io.StringIO()
-        with patch.object(cli, "load_candidates", return_value=candidates):
-            active_payload = cli.run_fetch(
-                history_file=self.history_file,
-                history_now=selected_at + history.HISTORY_TTL_SECONDS - 1,
-                output=before_expiry,
-                today=date(2026, 8, 12),
-            )
-
-        self.assertEqual(active_payload["status"], "insufficient_candidates")
-        self.assertEqual(
-            [candidate["id"] for candidate in active_payload["candidates"]],
-            identifiers[2:],
-        )
-        self.assertIn("3 von 4 benötigt", active_payload["message"])
-        self.assertEqual(json.loads(before_expiry.getvalue()), active_payload)
-        self.assertNotIn(identifiers[0], before_expiry.getvalue())
-        self.assertNotIn(identifiers[1], before_expiry.getvalue())
-
-        at_expiry = io.StringIO()
-        with patch.object(cli, "load_candidates", return_value=candidates):
-            expired_payload = cli.run_fetch(
-                history_file=self.history_file,
-                history_now=selected_at + history.HISTORY_TTL_SECONDS,
-                output=at_expiry,
-                today=date(2026, 8, 12),
-            )
-
-        self.assertEqual(expired_payload["status"], "ready")
-        self.assertEqual(
-            [candidate["id"] for candidate in expired_payload["candidates"]],
-            identifiers,
-        )
-
-    def test_fetch_reports_no_candidates_when_every_candidate_is_recent(self):
-        selected_at = 1_800_000_000.0
-        identifiers = [candidate_id(candidate) for candidate in self.candidates]
-        history.record_selected_ids(
-            self.history_file,
-            identifiers,
-            now=selected_at,
-        )
-        output = io.StringIO()
-
-        with patch.object(cli, "load_candidates", return_value=self.candidates):
-            payload = cli.run_fetch(
-                history_file=self.history_file,
-                history_now=selected_at,
-                output=output,
-                today=date(2026, 8, 12),
-            )
-
-        self.assertEqual(payload["status"], "no_candidates")
-        self.assertEqual(payload["candidates"], [])
-        self.assertIn("Keine passenden Dokumentationen", payload["message"])
-
-    def test_recent_ids_do_not_refill_an_explicit_upstream_limit(self):
-        selected_at = 1_800_000_000.0
-        candidates = [
-            *self.candidates,
-            make_candidate("Five", website="https://example.invalid/five"),
-        ]
-        identifiers = [candidate_id(candidate) for candidate in candidates]
-        history.record_selected_ids(
-            self.history_file,
-            [identifiers[0]],
-            now=selected_at,
-        )
-        output = io.StringIO()
-
-        with patch.object(cli, "load_candidates", return_value=candidates[:4]) as load:
-            payload = cli.run_fetch(
-                limit=4,
-                history_file=self.history_file,
-                history_now=selected_at,
-                output=output,
-                today=date(2026, 8, 12),
-            )
-
-        self.assertEqual(payload["status"], "insufficient_candidates")
-        self.assertEqual(
-            [candidate["id"] for candidate in payload["candidates"]], identifiers[1:4]
-        )
-        self.assertNotIn(identifiers[4], output.getvalue())
-        self.assertEqual(load.call_args.kwargs["limit"], 4)
-
-    def test_corrupted_history_warns_without_contaminating_fetch_json(self):
-        self.history_file.write_text("{not valid json", encoding="utf-8")
-        output = io.StringIO()
-        stderr = io.StringIO()
-
-        with patch.object(cli, "load_candidates", return_value=self.candidates), redirect_stderr(
-            stderr
-        ):
-            payload = cli.run_fetch(
-                history_file=self.history_file,
-                history_now=1_800_000_000.0,
-                output=output,
-                today=date(2026, 8, 12),
-            )
-
-        self.assertEqual(json.loads(output.getvalue()), payload)
-        self.assertIn("Warning: Recommendation history", stderr.getvalue())
-
-
 class SelectionArgumentTests(unittest.TestCase):
     def setUp(self):
         self.candidates = [
@@ -685,7 +447,7 @@ class SelectionArgumentTests(unittest.TestCase):
 
     def test_resolver_rejects_unknown_but_well_formed_id(self):
         one, two, _three, extra = self.identifiers
-        unknown = candidate_id(make_candidate("Not in this fetch"))
+        unknown = candidate_id(make_candidate("Not in this request"))
         self.assertNotIn(unknown, self.identifiers)
         selection_argument = f"{one},{two},{unknown},x{extra}"
 
@@ -862,7 +624,7 @@ class CacheTests(unittest.TestCase):
             expected_cache = data_dir / filmliste.FILMLISTE_FILENAME
             messages = []
 
-            def download(command):
+            def download(command, **_kwargs):
                 Path(command[3]).write_bytes(lzma.compress(b'{"X": []}'))
                 return Mock(returncode=0)
 
@@ -875,6 +637,7 @@ class CacheTests(unittest.TestCase):
         command = curl.call_args.args[0]
         self.assertEqual(command[:3], ["curl", "-fsSL", "-o"])
         self.assertEqual(command[4], filmliste.DOWNLOAD_URL)
+        self.assertIs(curl.call_args.kwargs["stderr"], filmliste.subprocess.PIPE)
         self.assertNotEqual(Path(command[3]), expected_cache)
         self.assertTrue(any("Downloading Filmliste-akt.xz" in item for item in messages))
         self.assertIn("Download complete.", messages)
@@ -954,45 +717,83 @@ class CliIntegrationTests(unittest.TestCase):
             make_candidate("Extra", website="https://example.invalid/extra"),
         ]
 
-    def test_configured_bare_cli_prints_help_to_stderr_and_exits_with_status_two(self):
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+    def test_bare_parser_keeps_filters_and_rejects_removed_interfaces(self):
+        arguments = cli.build_argument_parser().parse_args([])
+        self.assertIsNone(arguments.command)
+        self.assertEqual(arguments.min_duration, cli.DEFAULT_MIN_DURATION)
+        self.assertIsNone(arguments.filter_file)
 
-        with patch.object(cli, "ensure_installation", return_value=False), redirect_stdout(
-            stdout
-        ), redirect_stderr(stderr):
-            with self.assertRaises(SystemExit) as error:
-                cli.main([])
+        arguments = cli.build_argument_parser().parse_args(
+            ["--min-duration", "60", "--filter-file", "custom.txt"]
+        )
+        self.assertEqual(arguments.min_duration, 60)
+        self.assertEqual(arguments.filter_file, Path("custom.txt"))
 
-        self.assertEqual(error.exception.code, 2)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("usage:", stderr.getvalue())
-        self.assertIn("fetch", stderr.getvalue())
-        self.assertIn("select", stderr.getvalue())
+        for removed in (["fetch"], ["select", "abc"], ["--limit", "4"]):
+            with self.subTest(removed=removed), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    cli.build_argument_parser().parse_args(removed)
+                self.assertEqual(error.exception.code, 2)
 
-    def test_version_does_not_require_onboarding(self):
-        stdout = io.StringIO()
-        stderr = io.StringIO()
+    def test_help_version_and_setup_help_do_not_require_onboarding(self):
+        cases = [
+            (["--help"], "usage:"),
+            (["--version"], "dokutipp 2.1.0"),
+            (["setup", "--help"], "usage:"),
+        ]
 
-        with patch.object(cli, "ensure_installation") as ensure, redirect_stdout(
-            stdout
-        ), redirect_stderr(stderr):
-            with self.assertRaises(SystemExit) as error:
-                cli.main(["--version"])
+        for arguments, expected in cases:
+            with self.subTest(arguments=arguments):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(cli, "ensure_installation") as ensure, redirect_stdout(
+                    stdout
+                ), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as error:
+                        cli.main(arguments)
 
-        self.assertEqual(error.exception.code, 0)
-        self.assertEqual(stdout.getvalue(), "dokutipp 2.1.0\n")
-        self.assertEqual(stderr.getvalue(), "")
+                self.assertEqual(error.exception.code, 0)
+                self.assertIn(expected, stdout.getvalue())
+                self.assertEqual(stderr.getvalue(), "")
+                ensure.assert_not_called()
+
+    def test_setup_with_a_preceding_top_level_option_stays_administrative(self):
+        with patch.object(cli, "run_setup") as setup, patch.object(
+            cli, "ensure_installation"
+        ) as ensure:
+            cli.main(
+                ["--min-duration", "60", "setup"],
+                input_stream=io.StringIO(),
+            )
+
+        setup.assert_called_once()
         ensure.assert_not_called()
 
-    def test_load_candidates_reuses_the_existing_parser_filters(self):
-        filmliste = Path("/tmp/Filmliste-akt.xz")
+    def test_unknown_arguments_are_rejected_before_preflight(self):
+        with patch.object(cli, "ensure_installation") as ensure:
+            with redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    cli.main(["--unknown"], input_stream=io.StringIO())
+
+        self.assertEqual(error.exception.code, 2)
+        ensure.assert_not_called()
+
+    def test_removed_legacy_command_runs_preflight_before_argparse_rejects_it(self):
+        with patch.object(cli, "ensure_installation", return_value=False) as ensure:
+            with redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    cli.main(["fetch"], input_stream=io.StringIO())
+
+        self.assertEqual(error.exception.code, 2)
+        ensure.assert_called_once()
+
+    def test_load_candidates_reuses_existing_parser_filters_without_limit(self):
+        filmliste_path = Path("/tmp/Filmliste-akt.xz")
         filter_file = Path("/tmp/filters.txt")
-        with patch.object(cli, "ensure_filmliste", return_value=filmliste):
+        with patch.object(cli, "ensure_filmliste", return_value=filmliste_path):
             with patch.object(cli, "parse_filmliste", return_value=self.candidates) as parse:
                 result = cli.load_candidates(
                     data_dir=Path("/tmp/data"),
-                    limit=12,
                     min_duration=90,
                     excluded_channels=("WDR",),
                     filter_file=filter_file,
@@ -1000,82 +801,115 @@ class CliIntegrationTests(unittest.TestCase):
 
         self.assertIs(result, self.candidates)
         parse.assert_called_once_with(
-            filmliste,
-            limit=12,
+            filmliste_path,
             min_duration=90,
             excluded_channels=("WDR",),
             filter_file=filter_file,
         )
 
-    def test_cli_reloads_personal_sender_file_for_fetch_and_select(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            root = Path(temporary_directory)
-            sender_filter = root / "senders.txt"
-            sender_filter.write_text("KiKA\n", encoding="utf-8")
-            app_config = onboarding.AppConfig(
-                skill_root=root / "skills",
-                sender_filter_file=sender_filter,
-            )
-            identifiers = [candidate_id(candidate) for candidate in self.candidates]
-            selection_argument = (
-                f"{identifiers[0]},{identifiers[1]},{identifiers[2]},"
-                f"x{identifiers[3]}"
-            )
-            fetch_output = io.StringIO()
-            select_output = io.StringIO()
+    def test_main_loads_profile_and_sender_filters_for_the_bare_workflow(self):
+        filter_file = Path("/tmp/custom-filters.txt")
+        app_config = onboarding.AppConfig(
+            skill_root=Path("/tmp/dokutipp-skills"),
+            sender_filter_file=Path("/tmp/senders.txt"),
+        )
 
-            with patch.object(cli, "ensure_installation", return_value=False), patch.object(
-                cli, "load_config", return_value=app_config
-            ), patch.object(
-                cli, "load_candidates", return_value=self.candidates
-            ) as load, redirect_stdout(fetch_output):
-                cli.main(
-                    ["fetch"],
-                    history_file=self.history_file,
-                    history_now=1_800_000_000.0,
-                )
-                sender_filter.write_text("ZDF\n", encoding="utf-8")
-                with redirect_stdout(select_output):
-                    cli.main(
-                        ["select", selection_argument],
-                        history_file=self.history_file,
-                        history_now=1_800_000_000.0,
-                    )
+        with patch.object(cli, "ensure_installation", return_value=False), patch.object(
+            cli, "load_config", return_value=app_config
+        ), patch.object(
+            cli, "load_sender_filters", return_value=("WDR",)
+        ) as senders, patch.object(
+            cli, "load_profile", return_value="profile"
+        ) as profile, patch.object(
+            cli, "run_recommendations"
+        ) as run:
+            cli.main(
+                ["--min-duration", "60", "--filter-file", str(filter_file)],
+                data_dir=Path("/tmp/data"),
+                input_stream=io.StringIO(),
+                history_file=self.history_file,
+            )
 
+        senders.assert_called_once_with(app_config.sender_filter_file)
+        profile.assert_called_once_with(app_config.skill_root)
+        self.assertEqual(run.call_args.kwargs["profile"], "profile")
+        self.assertEqual(run.call_args.kwargs["min_duration"], 60)
+        self.assertEqual(run.call_args.kwargs["excluded_channels"], ("WDR",))
+        self.assertEqual(run.call_args.kwargs["filter_file"], filter_file)
+
+    def test_recursive_dialog_uses_ndjson_and_records_only_the_final_selection(self):
+        candidates = [
+            make_candidate(number, website=f"https://example.invalid/{number}")
+            for number in range(60)
+        ]
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        selections = RequestDrivenInput(stderr)
+
+        with patch.object(cli, "load_candidates", return_value=candidates):
+            cli.run_recommendations(
+                profile="# Profile\n\nHistory",
+                history_file=self.history_file,
+                history_now=1_800_000_000.0,
+                input_stream=selections,
+                event_output=stderr,
+                output=stdout,
+                today=date(2026, 8, 23),
+                rng=random.Random(7),
+                request_id_factory=iter(("one", "two", "final")).__next__,
+            )
+
+        events = [json.loads(line) for line in stderr.getvalue().splitlines()]
+        requests = [event for event in events if event["type"] == "selection_request"]
         self.assertEqual(
-            json.loads(fetch_output.getvalue())["filters"]["excluded_channels"],
-            ["KiKA"],
+            [(request["phase"], len(request["candidates"])) for request in requests],
+            [("preselection", 50), ("preselection", 10), ("final", 8)],
         )
-        self.assertEqual(load.call_args_list[0].kwargs["excluded_channels"], ("KiKA",))
-        self.assertEqual(load.call_args_list[1].kwargs["excluded_channels"], ("ZDF",))
-        self.assertTrue(select_output.getvalue().startswith("# 📺 DokuTipps der Woche"))
+        self.assertTrue(stdout.getvalue().startswith("# 📺 DokuTipps der Woche"))
+        self.assertNotIn('"type":"selection_request"', stdout.getvalue())
+        self.assertNotIn("https://example.invalid", stderr.getvalue())
+        final_ids = {candidate["id"] for candidate in requests[-1]["candidates"][:4]}
+        self.assertEqual(
+            history.load_recent_ids(self.history_file, now=1_800_000_000.0),
+            final_ids,
+        )
 
-    def test_successful_select_records_all_four_ids_including_the_extra(self):
-        selected_at = 1_800_000_000.0
-        identifiers = [candidate_id(candidate) for candidate in self.candidates]
-        selection_argument = (
-            f"{identifiers[2]},x{identifiers[3]},"
-            f"{identifiers[0]},{identifiers[1]}"
+    def test_invalid_selection_reemits_the_identical_request(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        selections = RequestDrivenInput(
+            stderr,
+            responses=["", RequestDrivenInput.VALID],
         )
-        output = io.StringIO()
 
         with patch.object(cli, "load_candidates", return_value=self.candidates):
-            cli.run_select(
-                selection_argument,
+            cli.run_recommendations(
+                profile="profile",
                 history_file=self.history_file,
-                history_now=selected_at,
-                output=output,
-                today=date(2026, 8, 12),
+                history_now=1_800_000_000.0,
+                input_stream=selections,
+                event_output=stderr,
+                output=stdout,
+                rng=random.Random(1),
+                request_id_factory=lambda: "stable",
             )
 
-        self.assertTrue(output.getvalue().startswith("# 📺 DokuTipps der Woche"))
+        lines = stderr.getvalue().splitlines()
+        request_lines = [
+            line for line in lines if json.loads(line)["type"] == "selection_request"
+        ]
+        events = [json.loads(line) for line in lines]
+        self.assertEqual(len(request_lines), 2)
+        self.assertEqual(request_lines[0], request_lines[1])
         self.assertEqual(
-            set(history.load_recent_ids(self.history_file, now=selected_at)),
-            set(identifiers),
+            [event["type"] for event in events],
+            ["selection_request", "selection_error", "selection_request"],
         )
+        self.assertTrue(stdout.getvalue().startswith("# 📺 DokuTipps der Woche"))
 
-    def test_invalid_select_does_not_create_or_mutate_history(self):
-        selected_at = 1_800_000_000.0
+    def test_eof_at_every_dialog_stage_keeps_stdout_and_history_unchanged(self):
+        history_now = 1_800_000_000.0
+        selected_at = history_now - history.HISTORY_TTL_SECONDS - 60
         existing_identifier = "f" * 64
         history.record_selected_ids(
             self.history_file,
@@ -1084,317 +918,304 @@ class CliIntegrationTests(unittest.TestCase):
         )
         history_before = self.history_file.read_bytes()
 
-        with patch.object(cli, "load_candidates", return_value=self.candidates):
-            with self.assertRaisesRegex(SelectionError, "exactly four"):
-                cli.run_select(
-                    "not-a-valid-selection",
-                    history_file=self.history_file,
-                    history_now=selected_at + 60,
-                    output=io.StringIO(),
-                )
+        cases = [
+            ("before_first_selection", self.candidates, [RequestDrivenInput.EOF], 1),
+            (
+                "after_validation_error",
+                self.candidates,
+                ["", RequestDrivenInput.EOF],
+                2,
+            ),
+            (
+                "mid_round",
+                [make_candidate(number) for number in range(120)],
+                [RequestDrivenInput.VALID, RequestDrivenInput.EOF],
+                2,
+            ),
+            (
+                "in_final",
+                [make_candidate(number) for number in range(60)],
+                [
+                    RequestDrivenInput.VALID,
+                    RequestDrivenInput.VALID,
+                    RequestDrivenInput.EOF,
+                ],
+                3,
+            ),
+        ]
 
-        self.assertEqual(self.history_file.read_bytes(), history_before)
+        for stage, candidates, responses, expected_requests in cases:
+            with self.subTest(stage=stage):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                selections = RequestDrivenInput(stderr, responses=responses)
+                with patch.object(cli, "load_candidates", return_value=candidates):
+                    with self.assertRaises(SelectionError):
+                        cli.run_recommendations(
+                            profile="profile",
+                            history_file=self.history_file,
+                            history_now=history_now,
+                            input_stream=selections,
+                            event_output=stderr,
+                            output=stdout,
+                            rng=random.Random(2),
+                        )
 
-    def test_select_history_write_failure_emits_no_output_and_preserves_history(self):
-        identifiers = [candidate_id(candidate) for candidate in self.candidates]
-        selection_argument = (
-            f"{identifiers[0]},{identifiers[1]},{identifiers[2]},"
-            f"x{identifiers[3]}"
-        )
-        existing_identifier = "f" * 64
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(self.history_file.read_bytes(), history_before)
+                requests = [
+                    json.loads(line)
+                    for line in stderr.getvalue().splitlines()
+                    if json.loads(line)["type"] == "selection_request"
+                ]
+                self.assertEqual(len(requests), expected_requests)
+
+    def test_input_and_history_write_failures_are_atomic(self):
+        selected_at = 1_800_000_000.0
         history.record_selected_ids(
             self.history_file,
-            [existing_identifier],
-            now=1_800_000_000.0,
+            ["f" * 64],
+            now=selected_at,
         )
         history_before = self.history_file.read_bytes()
-        output = io.StringIO()
 
-        with patch.object(cli, "load_candidates", return_value=self.candidates), patch.object(
-            cli,
-            "record_selected_ids",
-            side_effect=history.RecommendationHistoryError("history write failed"),
-        ):
-            with self.assertRaisesRegex(
+        broken_input = Mock()
+        broken_input.readline.side_effect = OSError("input failed")
+        cases = [
+            ("input", broken_input, None, SelectionError),
+            (
+                "history",
+                RequestDrivenInput(io.StringIO()),
+                history.RecommendationHistoryError("history write failed"),
                 history.RecommendationHistoryError,
-                "history write failed",
-            ):
-                cli.run_select(
-                    selection_argument,
-                    history_file=self.history_file,
-                    history_now=1_800_000_060.0,
-                    output=output,
+            ),
+        ]
+
+        for failure, input_stream, history_error, expected_error in cases:
+            with self.subTest(failure=failure):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                if failure == "history":
+                    input_stream.event_output = stderr
+                history_patch = (
+                    patch.object(
+                        cli,
+                        "record_selected_ids",
+                        side_effect=history_error,
+                    )
+                    if history_error is not None
+                    else patch.object(cli, "record_selected_ids", wraps=cli.record_selected_ids)
                 )
+                with patch.object(
+                    cli, "load_candidates", return_value=self.candidates
+                ), history_patch:
+                    with self.assertRaises(expected_error):
+                        cli.run_recommendations(
+                            profile="profile",
+                            history_file=self.history_file,
+                            history_now=selected_at + 60,
+                            input_stream=input_stream,
+                            event_output=stderr,
+                            output=stdout,
+                            rng=random.Random(2),
+                        )
 
-        self.assertEqual(output.getvalue(), "")
-        self.assertEqual(self.history_file.read_bytes(), history_before)
+                self.assertEqual(stdout.getvalue(), "")
+                self.assertEqual(self.history_file.read_bytes(), history_before)
 
-    def test_cli_reports_a_history_write_failure_without_result_stdout(self):
-        identifiers = [candidate_id(candidate) for candidate in self.candidates]
-        selection_argument = (
-            f"{identifiers[0]},{identifiers[1]},{identifiers[2]},"
-            f"x{identifiers[3]}"
-        )
+    def test_no_and_insufficient_candidates_skip_the_dialog(self):
+        cases = [
+            ([], "Keine passenden Dokumentationen"),
+            (self.candidates[:3], "3 von 4 benötigt"),
+        ]
+
+        for candidates, expected in cases:
+            with self.subTest(count=len(candidates)):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(cli, "load_candidates", return_value=candidates):
+                    cli.run_recommendations(
+                        profile="profile",
+                        history_file=self.history_file,
+                        input_stream=io.StringIO(),
+                        event_output=stderr,
+                        output=stdout,
+                        today=date(2026, 8, 23),
+                    )
+
+                self.assertIn(expected, stdout.getvalue())
+                self.assertEqual(stderr.getvalue(), "")
+
+    def test_main_reports_protocol_errors_as_json_and_interrupts_without_tracebacks(self):
+        for raised, expected_code in (
+            (SelectionError("input ended"), 2),
+            (history.RecommendationHistoryError("history failed"), 2),
+            (KeyboardInterrupt(), 130),
+        ):
+            with self.subTest(raised=type(raised).__name__):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with patch.object(cli, "ensure_installation", return_value=False), patch.object(
+                    cli, "load_profile", return_value="profile"
+                ), patch.object(
+                    cli, "run_recommendations", side_effect=raised
+                ), redirect_stdout(stdout), redirect_stderr(stderr):
+                    with self.assertRaises(SystemExit) as error:
+                        cli.main([], history_file=self.history_file)
+
+                self.assertEqual(error.exception.code, expected_code)
+                self.assertEqual(stdout.getvalue(), "")
+                event = json.loads(stderr.getvalue())
+                self.assertEqual(event["type"], "error")
+                self.assertNotIn("Traceback", stderr.getvalue())
+
+    def test_download_failure_keeps_stdout_and_history_unchanged(self):
+        selected_at = 1_800_000_000.0
+        history.record_selected_ids(self.history_file, ["f" * 64], now=selected_at)
+        history_before = self.history_file.read_bytes()
         stdout = io.StringIO()
         stderr = io.StringIO()
+        app_config = onboarding.AppConfig(skill_root=Path("/tmp/dokutipp-skills"))
 
         with patch.object(cli, "ensure_installation", return_value=False), patch.object(
-            cli, "load_candidates", return_value=self.candidates
-        ), patch.object(
+            cli, "load_config", return_value=app_config
+        ), patch.object(cli, "load_profile", return_value="profile"), patch.object(
             cli,
-            "record_selected_ids",
-            side_effect=history.RecommendationHistoryError("history write failed"),
+            "prepare_filmliste",
+            side_effect=filmliste.FilmlisteError("download failed"),
         ), redirect_stdout(stdout), redirect_stderr(stderr):
             with self.assertRaises(SystemExit) as error:
                 cli.main(
-                    ["select", selection_argument],
+                    [],
+                    data_dir=self.history_file.parent / "data",
                     history_file=self.history_file,
-                    history_now=1_800_000_000.0,
+                    history_now=selected_at + 60,
+                    input_stream=io.StringIO(),
                 )
 
-        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(error.exception.code, 1)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("Error: history write failed", stderr.getvalue())
+        self.assertEqual(self.history_file.read_bytes(), history_before)
+        self.assertEqual(json.loads(stderr.getvalue())["type"], "error")
 
-    def test_fetch_then_select_end_to_end_uses_stdout_for_results_and_stderr_for_logs(self):
+    def test_bare_workflow_end_to_end_uses_only_final_stdout(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
-            data_dir = Path(temporary_directory) / "data"
+            root = Path(temporary_directory)
+            data_dir = root / "data"
             data_dir.mkdir()
-            filmliste = data_dir / cli.FILMLISTE_FILENAME
+            cache = data_dir / cli.FILMLISTE_FILENAME
             now = int(time.time())
             entries = [
                 make_entry(
-                    "ARD",
-                    "One",
-                    "00:42:00",
-                    now,
-                    description="First source description.",
-                    website="https://example.invalid/one",
-                ),
-                make_entry(
-                    "ZDF",
-                    "Two",
-                    "01:05:00",
-                    now,
-                    description="Second source description.",
-                    website="https://example.invalid/two",
-                ),
-                make_entry(
-                    "ARTE.DE",
-                    "Three",
+                    channel,
+                    title,
                     "00:50:00",
                     now,
-                    description="Third source description.",
-                    website="https://example.invalid/three",
-                ),
-                make_entry(
-                    "ARD",
-                    "Extra",
-                    "00:58:00",
-                    now,
-                    description="Extra source description.",
-                    website="https://example.invalid/extra",
-                ),
+                    description=f"{title} description",
+                    website=f"https://example.invalid/{title.lower()}",
+                )
+                for channel, title in (
+                    ("ARD", "One"),
+                    ("ZDF", "Two"),
+                    ("ARTE.DE", "Three"),
+                    ("WDR", "Extra"),
+                )
             ]
-            write_filmliste(filmliste, entries)
-            filter_file = data_dir / "filters.txt"
-            filter_file.write_text(
-                "# No additional exclusions for this test\n",
-                encoding="utf-8",
-            )
+            write_filmliste(cache, entries)
+            filter_file = root / "filters.txt"
+            filter_file.write_text("# none\n", encoding="utf-8")
+            skill_root = root / "skills"
+            profile_file = skill_root / "dokutipp" / "PROFILE.md"
+            profile_file.parent.mkdir(parents=True)
+            profile_file.write_text("# Profile\n\nScience", encoding="utf-8")
+            app_config = onboarding.AppConfig(skill_root=skill_root)
 
-            fetch_stdout = io.StringIO()
-            fetch_stderr = io.StringIO()
-            with patch.object(
-                cli, "ensure_installation", return_value=False
-            ), redirect_stdout(fetch_stdout), redirect_stderr(fetch_stderr):
-                cli.main(
-                    [
-                        "fetch",
-                        "--limit",
-                        "4",
-                        "--min-duration",
-                        "42",
-                        "--filter-file",
-                        str(filter_file),
-                    ],
-                    data_dir=data_dir,
-                    history_file=self.history_file,
-                    history_now=1_800_000_000.0,
-                )
-
-            fetch_payload = json.loads(fetch_stdout.getvalue())
-            candidate_ids = [candidate["id"] for candidate in fetch_payload["candidates"]]
-            selection_argument = ",".join(
-                [
-                    candidate_ids[2],
-                    f"{EXTRA_ID_PREFIX}{candidate_ids[3]}",
-                    candidate_ids[0],
-                    candidate_ids[1],
-                ]
-            )
-
-            select_stdout = io.StringIO()
-            select_stderr = io.StringIO()
-            with patch.object(
-                cli, "ensure_installation", return_value=False
-            ), redirect_stdout(select_stdout), redirect_stderr(select_stderr):
-                cli.main(
-                    [
-                        "select",
-                        selection_argument,
-                        "--limit",
-                        "4",
-                        "--min-duration",
-                        "42",
-                        "--filter-file",
-                        str(filter_file),
-                    ],
-                    data_dir=data_dir,
-                    history_file=self.history_file,
-                    history_now=1_800_000_000.0,
-                )
-
-            repeated_fetch_stdout = io.StringIO()
-            repeated_fetch_stderr = io.StringIO()
-            with patch.object(
-                cli, "ensure_installation", return_value=False
-            ), redirect_stdout(repeated_fetch_stdout), redirect_stderr(
-                repeated_fetch_stderr
-            ):
-                cli.main(
-                    [
-                        "fetch",
-                        "--limit",
-                        "4",
-                        "--min-duration",
-                        "42",
-                        "--filter-file",
-                        str(filter_file),
-                    ],
-                    data_dir=data_dir,
-                    history_file=self.history_file,
-                    history_now=1_800_000_000.0,
-                )
-            repeated_fetch_payload = json.loads(repeated_fetch_stdout.getvalue())
-
-        self.assertEqual(fetch_payload["status"], "ready")
-        self.assertNotIn("https://example.invalid/one", fetch_stdout.getvalue())
-        self.assertNotIn("Filmliste-akt.xz is fresh", fetch_stdout.getvalue())
-        self.assertIn("Filmliste-akt.xz is fresh", fetch_stderr.getvalue())
-        self.assertTrue(select_stdout.getvalue().startswith("# 📺 DokuTipps der Woche"))
-        self.assertNotIn('"status"', select_stdout.getvalue())
-        self.assertNotIn("Filmliste-akt.xz is fresh", select_stdout.getvalue())
-        self.assertIn("Filmliste-akt.xz is fresh", select_stderr.getvalue())
-        self.assertLess(
-            select_stdout.getvalue().index("### 1. 🎬 Three"),
-            select_stdout.getvalue().index("### 2. 🎬 One"),
-        )
-        self.assertLess(
-            select_stdout.getvalue().index("### 2. 🎬 One"),
-            select_stdout.getvalue().index("### 3. 🎬 Two"),
-        )
-        self.assertIn("## 🔭 Extra-Empfehlung", select_stdout.getvalue())
-        self.assertIn(
-            "[Zur Mediathek](https://example.invalid/three)", select_stdout.getvalue()
-        )
-        self.assertIn(
-            "[Zur Mediathek](https://example.invalid/extra)", select_stdout.getvalue()
-        )
-        self.assertEqual(repeated_fetch_payload["status"], "no_candidates")
-        self.assertEqual(repeated_fetch_payload["candidates"], [])
-
-    def test_select_validation_failure_writes_only_a_stderr_error(self):
-        stdout = io.StringIO()
-        stderr = io.StringIO()
-        with patch.object(cli, "load_candidates", return_value=self.candidates), patch.object(
-            cli, "ensure_installation", return_value=False
-        ):
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                with self.assertRaises(SystemExit) as error:
-                    cli.main(
-                        ["select", "not-a-valid-selection"],
-                        history_file=self.history_file,
-                    )
-
-        self.assertEqual(error.exception.code, 2)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("Error: Selection must contain exactly four", stderr.getvalue())
-
-    def test_invalid_filter_file_is_reported_as_cli_error(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            filter_file = Path(temporary_directory) / "filters.txt"
-            filter_file.write_text("[unterminated", encoding="utf-8")
             stdout = io.StringIO()
             stderr = io.StringIO()
-
-            with patch.object(cli, "load_candidates", return_value=[]), patch.object(
-                cli, "ensure_installation", return_value=False
-            ):
-                with redirect_stdout(stdout), redirect_stderr(stderr):
-                    with self.assertRaises(SystemExit) as error:
-                        cli.main(
-                            ["fetch", "--filter-file", str(filter_file)],
-                            history_file=self.history_file,
-                        )
-
-        self.assertEqual(error.exception.code, 2)
-        self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("Invalid title filter", stderr.getvalue())
-
-    def test_explicit_filter_file_is_used_for_fetch_metadata(self):
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            filter_file = Path(temporary_directory) / "filters.txt"
-            filter_file.write_text(
-                "# Ignore comments and blank lines\n\nMittags[- ]magazin\n",
-                encoding="utf-8",
-            )
-            output = io.StringIO()
-
-            with patch.object(cli, "load_candidates", return_value=self.candidates):
-                payload = cli.run_fetch(
-                    filter_file=filter_file,
+            selections = RequestDrivenInput(stderr)
+            with patch.object(cli, "ensure_installation", return_value=False), patch.object(
+                cli, "load_config", return_value=app_config
+            ), redirect_stdout(stdout), redirect_stderr(stderr):
+                cli.main(
+                    ["--filter-file", str(filter_file)],
+                    data_dir=data_dir,
+                    input_stream=selections,
                     history_file=self.history_file,
-                    output=output,
+                    history_now=1_800_000_000.0,
                 )
 
-        self.assertEqual(payload["filters"]["title_exclusions"], ["Mittags[- ]magazin"])
-
-    def test_select_workflow_does_not_read_skill_md(self):
-        identifiers = [candidate_id(candidate) for candidate in self.candidates]
-        selection_argument = (
-            f"{identifiers[0]},{identifiers[1]},{identifiers[2]},"
-            f"x{identifiers[3]}"
+        events = [json.loads(line) for line in stderr.getvalue().splitlines()]
+        self.assertTrue(any(event["type"] == "progress" for event in events))
+        self.assertEqual(
+            len([event for event in events if event["type"] == "selection_request"]),
+            1,
         )
-        output = io.StringIO()
-        original_read_text = Path.read_text
+        self.assertTrue(stdout.getvalue().startswith("# 📺 DokuTipps der Woche"))
+        self.assertIn("[Zur Mediathek](https://example.invalid/", stdout.getvalue())
 
-        def read_text_except_skill(path, *args, **kwargs):
-            if path.name == "SKILL.md":
-                raise AssertionError("SKILL.md must not be read")
-            return original_read_text(path, *args, **kwargs)
+    def test_selection_dialog_flushes_and_round_trips_over_a_real_pty(self):
+        master_descriptor, slave_descriptor = pty.openpty()
+        terminal_attributes = termios.tcgetattr(slave_descriptor)
+        terminal_attributes[3] &= ~termios.ECHO
+        termios.tcsetattr(slave_descriptor, termios.TCSANOW, terminal_attributes)
+        input_stream = os.fdopen(
+            os.dup(slave_descriptor), "r", buffering=1, encoding="utf-8"
+        )
+        event_output = os.fdopen(
+            os.dup(slave_descriptor), "w", buffering=1, encoding="utf-8"
+        )
+        os.close(slave_descriptor)
+        stdout = io.StringIO()
+        failures = []
 
-        with tempfile.TemporaryDirectory() as temporary_directory:
-            original_cwd = Path.cwd()
+        def run_dialog():
             try:
-                os.chdir(temporary_directory)
                 with patch.object(cli, "load_candidates", return_value=self.candidates):
-                    with patch.object(
-                        Path,
-                        "read_text",
-                        autospec=True,
-                        side_effect=read_text_except_skill,
-                    ):
-                        cli.run_select(
-                            selection_argument,
-                            history_file=self.history_file,
-                            output=output,
-                            today=date(2026, 8, 12),
-                        )
-            finally:
-                os.chdir(original_cwd)
+                    cli.run_recommendations(
+                        profile="# Profile\n\nScience",
+                        history_file=self.history_file,
+                        input_stream=input_stream,
+                        event_output=event_output,
+                        output=stdout,
+                        rng=random.Random(11),
+                        request_id_factory=lambda: "pty-request",
+                    )
+            except Exception as error:  # pragma: no cover - asserted by parent
+                failures.append(error)
 
-        self.assertIn("## 🔭 Extra-Empfehlung", output.getvalue())
+        worker = threading.Thread(target=run_dialog, daemon=True)
+        worker.start()
+        try:
+            request_bytes = b""
+            deadline = time.monotonic() + 3
+            while b"\n" not in request_bytes:
+                remaining = deadline - time.monotonic()
+                self.assertGreater(remaining, 0, "selection request was not flushed")
+                readable, _, _ = select_module.select(
+                    [master_descriptor], [], [], remaining
+                )
+                self.assertTrue(readable, "selection request was not flushed")
+                request_bytes += os.read(master_descriptor, 65_536)
+
+            request_line = request_bytes.split(b"\n", 1)[0].strip()
+            request = json.loads(request_line.decode("utf-8"))
+            self.assertEqual(request["type"], "selection_request")
+            self.assertEqual(request["request_id"], "pty-request")
+            self.assertEqual(stdout.getvalue(), "")
+
+            identifiers = [candidate["id"] for candidate in request["candidates"]]
+            response = ",".join([*identifiers[:3], f"x{identifiers[3]}"])
+            os.write(master_descriptor, response.encode("utf-8") + b"\n")
+            worker.join(timeout=3)
+            self.assertFalse(worker.is_alive(), "selection dialog did not finish")
+        finally:
+            input_stream.close()
+            event_output.close()
+            os.close(master_descriptor)
+            worker.join(timeout=1)
+
+        self.assertEqual(failures, [])
+        self.assertTrue(stdout.getvalue().startswith("# 📺 DokuTipps der Woche"))
 
     def test_parser_does_not_prefer_a_sender_by_default(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1412,7 +1233,6 @@ class CliIntegrationTests(unittest.TestCase):
 
             results = parser.parse_filmliste(
                 filmliste,
-                limit=cli.DEFAULT_LIMIT,
                 min_duration=cli.DEFAULT_MIN_DURATION,
                 excluded_channels=(),
             )
@@ -1633,7 +1453,7 @@ class CliIntegrationTests(unittest.TestCase):
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
             argument_parser.parse_args(["cache.xz", "--channels", "ARD"])
         with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            cli.build_argument_parser().parse_args(["fetch", "--channels", "ARD"])
+            cli.build_argument_parser().parse_args(["--channels", "ARD"])
 
     def test_invalid_filter_regex_includes_file_and_line(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -1777,17 +1597,17 @@ class OnboardingTests(unittest.TestCase):
 
             subsequent_stdout = io.StringIO()
             subsequent_stderr = io.StringIO()
-            with redirect_stdout(subsequent_stdout), redirect_stderr(subsequent_stderr):
-                with self.assertRaises(SystemExit) as error:
-                    cli.main(
-                        [],
-                        input_stream=io.StringIO(),
-                        environment={"HERMES_HOME": str(hermes_home)},
-                        home=home,
-                    )
-            self.assertEqual(error.exception.code, 2)
-            self.assertEqual(subsequent_stdout.getvalue(), "")
-            self.assertIn("usage:", subsequent_stderr.getvalue())
+            with patch.object(cli, "load_candidates", return_value=[]), redirect_stdout(
+                subsequent_stdout
+            ), redirect_stderr(subsequent_stderr):
+                cli.main(
+                    [],
+                    input_stream=io.StringIO(),
+                    environment={"HERMES_HOME": str(hermes_home)},
+                    home=home,
+                )
+            self.assertIn("Keine passenden Dokumentationen", subsequent_stdout.getvalue())
+            self.assertEqual(subsequent_stderr.getvalue(), "")
 
     def test_new_onboarding_does_not_read_or_modify_legacy_config_or_data(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2088,11 +1908,21 @@ class OnboardingTests(unittest.TestCase):
         master_descriptor, slave_descriptor = pty.openpty()
         input_stream = os.fdopen(os.dup(slave_descriptor), "r", buffering=1)
         output_stream = os.fdopen(os.dup(slave_descriptor), "w", buffering=1)
+        transcript_parts = []
 
         def send_keys():
             time.sleep(0.05)
             os.write(master_descriptor, b" ")
-            time.sleep(0.05)
+            observed = b""
+            deadline = time.monotonic() + 2
+            while b"- [ ] ARD" not in observed and time.monotonic() < deadline:
+                readable, _, _ = select_module.select(
+                    [master_descriptor], [], [], 0.05
+                )
+                if readable:
+                    chunk = os.read(master_descriptor, 65_536)
+                    transcript_parts.append(chunk)
+                    observed += chunk
             os.write(master_descriptor, b"\r")
 
         key_sender = threading.Thread(target=send_keys, daemon=True)
@@ -2105,7 +1935,6 @@ class OnboardingTests(unittest.TestCase):
                 output_stream=output_stream,
             )
             os.set_blocking(master_descriptor, False)
-            transcript_parts = []
             while True:
                 try:
                     transcript_parts.append(os.read(master_descriptor, 65_536))
@@ -2171,25 +2000,99 @@ class OnboardingTests(unittest.TestCase):
 
             skill_file = skill_directory / "SKILL.md"
             skill_file.write_text("local change", encoding="utf-8")
-            onboarding.ensure_installation(
-                config_file=config_file,
-                home=root / "home",
-                input_stream=InteractiveInput("n\n"),
-                output_stream=io.StringIO(),
-                canonical_skill_file=self.canonical_skill,
-            )
+            preflight_input = InteractiveInput("y\n")
+            with self.assertRaisesRegex(onboarding.OnboardingError, "dokutipp setup"):
+                onboarding.ensure_installation(
+                    config_file=config_file,
+                    home=root / "home",
+                    input_stream=preflight_input,
+                    output_stream=io.StringIO(),
+                    canonical_skill_file=self.canonical_skill,
+                )
             self.assertEqual(skill_file.read_text(encoding="utf-8"), "local change")
+            self.assertEqual(preflight_input.tell(), 0)
 
-            onboarding.ensure_installation(
-                config_file=config_file,
-                home=root / "home",
+            onboarding._ensure_skill_file(
+                skill_file,
+                self.canonical_skill.read_bytes(),
                 input_stream=InteractiveInput("y\n"),
                 output_stream=io.StringIO(),
-                canonical_skill_file=self.canonical_skill,
+                allow_modified_replacement=True,
             )
             self.assertEqual(skill_file.read_bytes(), self.canonical_skill.read_bytes())
 
-    def test_preflight_requires_a_terminal_for_missing_profile_or_modified_skill(self):
+    def test_preflight_auto_updates_an_unchanged_previous_canonical_skill(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            skill_file = Path(temporary_directory) / "SKILL.md"
+            previous_canonical = b"previous canonical skill\n"
+            current_canonical = self.canonical_skill.read_bytes()
+            skill_file.write_bytes(previous_canonical)
+            output = io.StringIO()
+
+            previous_digest = onboarding.hashlib.sha256(previous_canonical).hexdigest()
+            with patch.object(
+                onboarding,
+                "KNOWN_CANONICAL_SKILL_SHA256S",
+                frozenset({previous_digest}),
+            ):
+                onboarding._ensure_skill_file(
+                    skill_file,
+                    current_canonical,
+                    input_stream=io.StringIO(),
+                    output_stream=output,
+                )
+
+            installed_bytes = skill_file.read_bytes()
+
+        self.assertEqual(installed_bytes, current_canonical)
+        self.assertIn("Updated SKILL.md", output.getvalue())
+
+    def test_all_released_canonical_skill_hashes_are_known_for_migration(self):
+        expected_hashes = {
+            "7bfd3fedb222cc5301b3913d907153cd3df236e810227c3050c4472ce1565efa",
+            "2a254d0cd38012fe0eee42a7bed6cdda2fe542847bf35370daf107f4e2b82b33",
+            "f88882d48add9a507cc0a9ac1f9c3fee5ba76eeb53835875a693f8809ecee887",
+            "8f9e570d44a119ffd0ec57da910c3fbe8e4c3854d2276cafea247e71aa0c21c7",
+            "6497692638dab8b0512e39ee40886d436e638c01492a6dc8dc6abb74ba1ad97b",
+            "66b25eac1a94dee212b0d68adbd799cb1724c92c1b3d412fe4a407766a23828e",
+            "2f8cc3148a80bbd132a51dc8f732852a28ce8df702fa15209ffe99ff37524c29",
+            "7f4b7bd1a23793d63182c8f83397548cc75635c0d28c00abd4110cf335fad8ad",
+        }
+
+        self.assertEqual(onboarding.KNOWN_CANONICAL_SKILL_SHA256S, expected_hashes)
+
+    def test_legacy_fetch_invocation_migrates_the_old_skill_before_rejection(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            skill_root = root / "skills"
+            skill_directory = self.write_complete_installation(skill_root)
+            config_file = root / "config.json"
+            self.write_config(config_file, skill_root)
+            skill_file = skill_directory / "SKILL.md"
+            previous_canonical = b"known previous canonical\n"
+            skill_file.write_bytes(previous_canonical)
+            previous_digest = onboarding.hashlib.sha256(previous_canonical).hexdigest()
+
+            with patch.object(
+                onboarding,
+                "KNOWN_CANONICAL_SKILL_SHA256S",
+                frozenset({previous_digest}),
+            ), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as error:
+                    cli.main(
+                        ["fetch"],
+                        config_file=config_file,
+                        home=root / "home",
+                        input_stream=io.StringIO(),
+                        canonical_skill_file=self.canonical_skill,
+                    )
+
+            installed_bytes = skill_file.read_bytes()
+
+        self.assertEqual(error.exception.code, 2)
+        self.assertEqual(installed_bytes, self.canonical_skill.read_bytes())
+
+    def test_preflight_redirects_missing_profile_or_modified_skill_to_setup(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             skill_root = root / "skills"
@@ -2209,7 +2112,7 @@ class OnboardingTests(unittest.TestCase):
 
             (skill_directory / "PROFILE.md").write_text("profile", encoding="utf-8")
             (skill_directory / "SKILL.md").write_text("local change", encoding="utf-8")
-            with self.assertRaisesRegex(onboarding.OnboardingError, "interactive terminal"):
+            with self.assertRaisesRegex(onboarding.OnboardingError, "dokutipp setup"):
                 onboarding.ensure_installation(
                     config_file=config_file,
                     home=root / "home",
@@ -2285,7 +2188,7 @@ class OnboardingTests(unittest.TestCase):
             self.assertIn("science", profile)
             self.assertIn("war", profile)
 
-    def test_unconfigured_noninteractive_fetch_has_no_stdout_and_skips_loading(self):
+    def test_unconfigured_noninteractive_bare_run_has_no_stdout_and_skips_loading(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             config_file = Path(temporary_directory) / "config.json"
             stdout = io.StringIO()
@@ -2295,17 +2198,19 @@ class OnboardingTests(unittest.TestCase):
             ), redirect_stderr(stderr):
                 with self.assertRaises(SystemExit) as error:
                     cli.main(
-                        ["fetch"],
+                        [],
                         config_file=config_file,
                         input_stream=io.StringIO(),
                     )
 
         self.assertEqual(error.exception.code, 2)
         self.assertEqual(stdout.getvalue(), "")
-        self.assertIn("interactive terminal", stderr.getvalue())
+        event = json.loads(stderr.getvalue())
+        self.assertEqual(event["type"], "error")
+        self.assertIn("interactive terminal", event["message"])
         load.assert_not_called()
 
-    def test_configured_preflight_keeps_fetch_stdout_machine_readable(self):
+    def test_configured_preflight_keeps_final_stdout_separate_from_requests(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             skill_root = root / "skills"
@@ -2314,51 +2219,38 @@ class OnboardingTests(unittest.TestCase):
             self.write_config(config_file, skill_root)
             stdout = io.StringIO()
             stderr = io.StringIO()
+            selections = RequestDrivenInput(stderr)
             candidates = [
-                make_candidate("One"),
-                make_candidate("Two"),
-                make_candidate("Three"),
-                make_candidate("Extra"),
+                make_candidate("One", website="https://example.invalid/one"),
+                make_candidate("Two", website="https://example.invalid/two"),
+                make_candidate("Three", website="https://example.invalid/three"),
+                make_candidate("Extra", website="https://example.invalid/extra"),
             ]
 
             with patch.object(cli, "load_candidates", return_value=candidates), redirect_stdout(
                 stdout
             ), redirect_stderr(stderr):
                 cli.main(
-                    ["fetch"],
+                    [],
                     config_file=config_file,
                     home=root / "home",
-                    input_stream=io.StringIO(),
+                    input_stream=selections,
                     history_file=root / "recommendation-history.json",
                 )
 
-        self.assertEqual(json.loads(stdout.getvalue())["status"], "ready")
-        self.assertEqual(stderr.getvalue(), "")
+        self.assertTrue(stdout.getvalue().startswith("# 📺 DokuTipps der Woche"))
+        events = [json.loads(line) for line in stderr.getvalue().splitlines()]
+        self.assertEqual([event["type"] for event in events], ["selection_request"])
 
-    def test_help_runs_preflight_before_argparse_output(self):
+    def test_help_skips_preflight_and_argparse_outputs_normally(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
             root = Path(temporary_directory)
             config_file = root / "config.json"
             stdout = io.StringIO()
             stderr = io.StringIO()
-            with redirect_stdout(stdout), redirect_stderr(stderr):
-                with self.assertRaises(SystemExit) as error:
-                    cli.main(
-                        ["--help"],
-                        config_file=config_file,
-                        home=root / "home",
-                        input_stream=io.StringIO(),
-                    )
-            self.assertEqual(error.exception.code, 2)
-            self.assertEqual(stdout.getvalue(), "")
-            self.assertIn("interactive terminal", stderr.getvalue())
-
-            skill_root = root / "skills"
-            self.write_complete_installation(skill_root)
-            self.write_config(config_file, skill_root)
-            stdout = io.StringIO()
-            stderr = io.StringIO()
-            with redirect_stdout(stdout), redirect_stderr(stderr):
+            with patch.object(cli, "ensure_installation") as ensure, redirect_stdout(
+                stdout
+            ), redirect_stderr(stderr):
                 with self.assertRaises(SystemExit) as error:
                     cli.main(
                         ["--help"],
@@ -2370,6 +2262,7 @@ class OnboardingTests(unittest.TestCase):
         self.assertEqual(error.exception.code, 0)
         self.assertIn("usage:", stdout.getvalue())
         self.assertEqual(stderr.getvalue(), "")
+        ensure.assert_not_called()
 
     def test_malformed_config_and_non_directory_root_are_reported(self):
         with tempfile.TemporaryDirectory() as temporary_directory:
@@ -2423,6 +2316,129 @@ class OnboardingTests(unittest.TestCase):
             onboarding.hermes_skill_root(environment={}, home=home),
             home / ".hermes/skills",
         )
+
+
+class PackagingTests(unittest.TestCase):
+    def test_installed_wheel_runs_and_finds_managed_files_from_a_foreign_cwd(self):
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            source_copy = root / "source"
+            source_copy.mkdir()
+            shutil.copytree(
+                SOURCE_ROOT,
+                source_copy / "src",
+                ignore=shutil.ignore_patterns("*.egg-info", "__pycache__"),
+            )
+            for filename in (
+                "pyproject.toml",
+                "README.md",
+                "LICENSE",
+                "SKILL.md",
+                "filters.txt",
+            ):
+                shutil.copy2(REPOSITORY_ROOT / filename, source_copy / filename)
+
+            wheel_directory = root / "wheel"
+            wheel_directory.mkdir()
+            environment = os.environ.copy()
+            environment.pop("PYTHONHOME", None)
+            environment.pop("PYTHONPATH", None)
+            environment.update(
+                {
+                    "PIP_CACHE_DIR": str(root / "pip-cache"),
+                    "PIP_DISABLE_PIP_VERSION_CHECK": "1",
+                    "PIP_NO_INDEX": "1",
+                    "PYTHONPYCACHEPREFIX": str(root / "pycache"),
+                }
+            )
+            subprocess.run(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "wheel",
+                    ".",
+                    "--no-deps",
+                    "--no-build-isolation",
+                    "--wheel-dir",
+                    str(wheel_directory),
+                ],
+                cwd=source_copy,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            wheel = next(wheel_directory.glob("dokutipp-*.whl"))
+
+            environment_directory = root / "venv"
+            venv.EnvBuilder(with_pip=True).create(environment_directory)
+            scripts_directory = (
+                environment_directory / "Scripts"
+                if os.name == "nt"
+                else environment_directory / "bin"
+            )
+            installed_python = scripts_directory / (
+                "python.exe" if os.name == "nt" else "python"
+            )
+            entry_point = scripts_directory / (
+                "dokutipp.exe" if os.name == "nt" else "dokutipp"
+            )
+            foreign_cwd = root / "foreign-cwd"
+            foreign_cwd.mkdir()
+
+            subprocess.run(
+                [
+                    str(installed_python),
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-deps",
+                    "--no-index",
+                    str(wheel),
+                ],
+                cwd=foreign_cwd,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            version = subprocess.run(
+                [str(entry_point), "--version"],
+                cwd=foreign_cwd,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+            installed_files = subprocess.run(
+                [
+                    str(installed_python),
+                    "-c",
+                    (
+                        "import json; "
+                        "from dokutipp.onboarding import canonical_skill_path; "
+                        "from dokutipp.parser import default_filter_file; "
+                        "skill=canonical_skill_path(); filters=default_filter_file(); "
+                        "print(json.dumps({'skill': str(skill), "
+                        "'skill_ok': skill.is_file() and "
+                        "'selection_request' in skill.read_text(encoding='utf-8'), "
+                        "'filters': str(filters), 'filters_ok': filters.is_file()}))"
+                    ),
+                ],
+                cwd=foreign_cwd,
+                env=environment,
+                check=True,
+                capture_output=True,
+                text=True,
+            )
+
+        resolved_files = json.loads(installed_files.stdout)
+        self.assertEqual(version.stdout.strip(), "dokutipp 2.1.0")
+        self.assertTrue(resolved_files["skill_ok"])
+        self.assertTrue(resolved_files["filters_ok"])
+        self.assertNotEqual(Path(resolved_files["skill"]).parent, REPOSITORY_ROOT)
+        self.assertNotEqual(Path(resolved_files["filters"]).parent, REPOSITORY_ROOT)
 
 
 def make_candidate(

@@ -35,11 +35,12 @@ def load_recent_ids(
     *,
     now: Optional[float] = None,
     warn: Optional[WarningCallback] = None,
+    read_only: bool = False,
 ) -> Set[str]:
     """Return selected IDs younger than seven days and prune expired entries.
 
-    Missing history is deliberately read-only: a normal `fetch` must not create
-    state until a selection has actually been made.
+    Missing history never creates state. ``read_only`` also defers pruning or
+    repairing an existing file until a successful selection is recorded.
     """
     timestamp = _timestamp(now)
     try:
@@ -52,9 +53,13 @@ def load_recent_ids(
         pass
 
     with _exclusive_lock(history_file):
-        entries, _ = _read_entries(history_file, warn=warn)
+        entries, _ = _read_entries(
+            history_file,
+            warn=warn,
+            reset_invalid=not read_only,
+        )
         recent_entries = _recent_entries(entries, now=timestamp)
-        if recent_entries != entries:
+        if not read_only and recent_entries != entries:
             _write_entries(history_file, recent_entries)
         return set(recent_entries)
 
@@ -85,7 +90,11 @@ def record_selected_ids(
 
     timestamp = _timestamp(now)
     with _exclusive_lock(history_file):
-        entries, _reset = _read_entries(history_file, warn=warn)
+        entries, _reset = _read_entries(
+            history_file,
+            warn=warn,
+            reset_invalid=False,
+        )
         entries = _recent_entries(entries, now=timestamp)
         entries.update({identifier: timestamp for identifier in identifiers})
         _write_entries(history_file, entries)
@@ -115,6 +124,7 @@ def _read_entries(
     history_file: Path,
     *,
     warn: Optional[WarningCallback],
+    reset_invalid: bool = True,
 ) -> tuple[Dict[str, float], bool]:
     """Load valid entries, or atomically reset a malformed history file."""
     try:
@@ -125,10 +135,13 @@ def _read_entries(
     except FileNotFoundError:
         return {}, False
     except (json.JSONDecodeError, OSError, UnicodeDecodeError, ValueError) as error:
-        _write_entries(history_file, {})
+        if reset_invalid:
+            _write_entries(history_file, {})
         _warn(
             warn,
-            f"Recommendation history {history_file} was invalid and has been reset ({error}).",
+            f"Recommendation history {history_file} was invalid and "
+            f"{'has been reset' if reset_invalid else 'will be reset after a successful selection'} "
+            f"({error}).",
         )
         return {}, True
 

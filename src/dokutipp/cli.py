@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import random
 import sys
 from datetime import date, datetime
 from pathlib import Path
-from typing import Any, Dict, Mapping, Optional, Sequence, TextIO
+from typing import Any, Callable, Mapping, Optional, Sequence, TextIO
 
 from . import __version__
 from .history import (
@@ -25,6 +26,8 @@ from .filmliste import (
 )
 from .onboarding import (
     OnboardingError,
+    PROFILE_FILENAME,
+    SKILL_DIRECTORY_NAME,
     SenderSelector,
     config_path,
     ensure_installation,
@@ -35,7 +38,6 @@ from .paths import data_directory
 from .parser import (
     FilterConfigError,
     load_sender_filters,
-    load_title_filters,
     parse_filmliste,
 )
 from .rendering import (
@@ -44,25 +46,45 @@ from .rendering import (
     render_recommendations,
 )
 from .selection import (
+    DEFAULT_CHUNK_SIZE,
     SelectionError,
     TOTAL_RECOMMENDATION_COUNT,
-    build_fetch_payload,
-    parse_selection_argument,
-    resolve_selection,
+    build_candidate_pool,
+    candidate_id,
+    select_recursively,
 )
 
 
 HISTORY_FILENAME = "recommendation-history.json"
-DEFAULT_LIMIT: Optional[int] = None
 DEFAULT_MIN_DURATION = 42
 
 
 def log(message: str) -> None:
-    """Write operational progress away from command result stdout."""
-    print(
-        f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}",
-        file=sys.stderr,
+    """Write one typed progress event away from command result stdout."""
+    _write_event(
+        "progress",
+        timestamp=datetime.now().isoformat(timespec="seconds"),
+        message=message,
     )
+
+
+def _write_json_line(value: Mapping[str, Any], output: TextIO) -> None:
+    """Write and flush one compact JSON object for the running CLI protocol."""
+    json.dump(value, output, ensure_ascii=False, separators=(",", ":"))
+    output.write("\n")
+    output.flush()
+
+
+def _write_event(
+    event_type: str,
+    *,
+    output: Optional[TextIO] = None,
+    **fields: Any,
+) -> None:
+    """Write one compact typed event to the recommendation event stream."""
+    if output is None:
+        output = sys.stderr
+    _write_json_line({"type": event_type, **fields}, output)
 
 
 def default_data_dir(home: Optional[Path] = None) -> Path:
@@ -77,23 +99,18 @@ def default_history_file(data_dir: Optional[Path] = None) -> Path:
     return data_dir / HISTORY_FILENAME
 
 
-def _history_warning(message: str) -> None:
-    print(f"Warning: {message}", file=sys.stderr)
-
-
 def ensure_filmliste(data_dir: Path) -> Path:
     """Create or refresh the existing local MediathekView cache."""
     try:
         return prepare_filmliste(data_dir, log=log)
     except FilmlisteError as error:
-        print(f"Error: {error}", file=sys.stderr)
+        _write_event("error", message=str(error))
         raise SystemExit(1)
 
 
 def load_candidates(
     *,
     data_dir: Optional[Path] = None,
-    limit: Optional[int] = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     excluded_channels: Sequence[str] = (),
     filter_file: Optional[Path] = None,
@@ -104,26 +121,44 @@ def load_candidates(
     filmliste = ensure_filmliste(data_dir)
     return parse_filmliste(
         filmliste,
-        limit=limit,
         min_duration=min_duration,
         excluded_channels=excluded_channels,
         filter_file=filter_file,
     )
 
 
-def run_fetch(
+def load_profile(skill_root: Path) -> str:
+    """Read the configured editorial profile once for one recommendation run."""
+    profile_file = skill_root / SKILL_DIRECTORY_NAME / PROFILE_FILENAME
+    try:
+        return profile_file.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as error:
+        raise OnboardingError(
+            f"Could not read DokuTipp profile {profile_file}: {error}"
+        ) from error
+
+
+def run_recommendations(
     *,
+    profile: str,
     data_dir: Optional[Path] = None,
-    limit: Optional[int] = DEFAULT_LIMIT,
     min_duration: int = DEFAULT_MIN_DURATION,
     excluded_channels: Sequence[str] = (),
     filter_file: Optional[Path] = None,
+    input_stream: Optional[TextIO] = None,
+    event_output: Optional[TextIO] = None,
     output: Optional[TextIO] = None,
     today: Optional[date] = None,
     history_file: Optional[Path] = None,
     history_now: Optional[float] = None,
-) -> Dict[str, Any]:
-    """Write the structured candidate set for agent-side ID selection."""
+    rng: Optional[random.Random] = None,
+    request_id_factory: Optional[Callable[[], Any]] = None,
+) -> None:
+    """Run recursive ID selection and emit only the final Markdown on stdout."""
+    if input_stream is None:
+        input_stream = sys.stdin
+    if event_output is None:
+        event_output = sys.stderr
     if output is None:
         output = sys.stdout
     if today is None:
@@ -131,87 +166,85 @@ def run_fetch(
 
     candidates = load_candidates(
         data_dir=data_dir,
-        limit=limit,
         min_duration=min_duration,
         excluded_channels=excluded_channels,
         filter_file=filter_file,
     )
-    title_filters = load_title_filters(filter_file)
+    def history_warning(message: str) -> None:
+        _write_event("warning", output=event_output, message=message)
+
     recent_ids = load_recent_ids(
         default_history_file(data_dir) if history_file is None else history_file,
         now=history_now,
-        warn=_history_warning,
+        warn=history_warning,
+        read_only=True,
     )
-    payload = build_fetch_payload(
+    candidate_pool = build_candidate_pool(
         candidates,
-        limit=limit,
-        min_duration=min_duration,
-        excluded_channels=excluded_channels,
-        title_filters=title_filters,
         excluded_ids=recent_ids,
     )
-    if payload["status"] == "no_candidates":
-        payload["message"] = render_no_candidates(today=today)
-    elif payload["status"] == "insufficient_candidates":
-        payload["message"] = render_insufficient_candidates(
-            available=len(payload["candidates"]),
-            required=TOTAL_RECOMMENDATION_COUNT,
-            today=today,
+
+    available = len(candidate_pool)
+    if not available:
+        output.write(render_no_candidates(today=today))
+        return
+    if available < TOTAL_RECOMMENDATION_COUNT:
+        output.write(
+            render_insufficient_candidates(
+                available=available,
+                required=TOTAL_RECOMMENDATION_COUNT,
+                today=today,
+            )
         )
-    json.dump(payload, output, ensure_ascii=False, indent=2)
-    output.write("\n")
-    return payload
+        return
 
+    def choose(
+        request: Mapping[str, Any], validation_error: Optional[SelectionError]
+    ) -> str:
+        if validation_error is not None:
+            _write_event(
+                "selection_error",
+                output=event_output,
+                request_id=request.get("request_id"),
+                message=str(validation_error),
+            )
+        try:
+            _write_json_line(request, event_output)
+            response = input_stream.readline()
+        except (OSError, UnicodeError, ValueError) as error:
+            raise SelectionError(
+                f"Could not exchange a candidate selection: {error}"
+            ) from error
+        if response == "":
+            raise SelectionError(
+                "Candidate selection input ended before the workflow was complete."
+            )
+        return response.rstrip("\r\n")
 
-def run_select(
-    selection_argument: str,
-    *,
-    data_dir: Optional[Path] = None,
-    limit: Optional[int] = DEFAULT_LIMIT,
-    min_duration: int = DEFAULT_MIN_DURATION,
-    excluded_channels: Sequence[str] = (),
-    filter_file: Optional[Path] = None,
-    output: Optional[TextIO] = None,
-    today: Optional[date] = None,
-    history_file: Optional[Path] = None,
-    history_now: Optional[float] = None,
-) -> None:
-    """Resolve an agent selection and write the complete final Markdown."""
-    if output is None:
-        output = sys.stdout
-    if today is None:
-        today = date.today()
-
-    candidates = load_candidates(
-        data_dir=data_dir,
-        limit=limit,
-        min_duration=min_duration,
-        excluded_channels=excluded_channels,
-        filter_file=filter_file,
+    selection = select_recursively(
+        candidate_pool,
+        profile=profile,
+        choose=choose,
+        chunk_size=DEFAULT_CHUNK_SIZE,
+        rng=rng,
+        request_id_factory=request_id_factory,
     )
-    selection = resolve_selection(selection_argument, candidates)
     rendered = render_recommendations(selection, today=today)
-    recommendation_ids, extra_recommendation_id = parse_selection_argument(
-        selection_argument
-    )
+    selected_ids = [
+        *(candidate_id(candidate) for candidate in selection.recommendations),
+        candidate_id(selection.extra_recommendation),
+    ]
     record_selected_ids(
         default_history_file(data_dir) if history_file is None else history_file,
-        [*recommendation_ids, extra_recommendation_id],
+        selected_ids,
         now=history_now,
-        warn=_history_warning,
+        warn=history_warning,
     )
     output.write(rendered)
 
 
-def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
-    """Add the shared MediathekView filter options to one subcommand."""
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=DEFAULT_LIMIT,
-        metavar="N",
-        help="Maximum number of filtered source candidates (default: no limit)",
-    )
+def add_recommendation_arguments(parser: argparse.ArgumentParser) -> None:
+    """Add the filters supported by the bare recommendation workflow."""
     parser.add_argument(
         "--min-duration",
         type=int,
@@ -230,36 +263,15 @@ def add_filter_arguments(parser: argparse.ArgumentParser) -> None:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Fetch MediathekView candidates or render a selected 3+1 DokuTipp result."
-        )
+        description="Select and render a current 3+1 DokuTipp result."
     )
     parser.add_argument(
         "--version",
         action="version",
         version=f"dokutipp {__version__}",
     )
-    subparsers = parser.add_subparsers(dest="command", required=True)
-
-    fetch_parser = subparsers.add_parser(
-        "fetch",
-        help="Output filtered, not-recently-recommended candidates as JSON.",
-    )
-    add_filter_arguments(fetch_parser)
-
-    select_parser = subparsers.add_parser(
-        "select",
-        help="Validate selected IDs and output the final recommendations.",
-    )
-    select_parser.add_argument(
-        "ids",
-        metavar="IDS",
-        help=(
-            "Four comma-separated SHA-256 IDs; prefix exactly one extra "
-            "recommendation with lowercase 'x'."
-        ),
-    )
-    add_filter_arguments(select_parser)
+    add_recommendation_arguments(parser)
+    subparsers = parser.add_subparsers(dest="command")
 
     subparsers.add_parser(
         "setup",
@@ -284,9 +296,12 @@ def main(
 ) -> None:
     parser = build_argument_parser()
     arguments = list(sys.argv[1:] if argv is None else argv)
-    if arguments == ["--version"]:
-        parser.parse_args(arguments)
-        return
+    legacy_invocation = bool(arguments) and arguments[0] in {"fetch", "select"}
+    # Parse every current interface before preflight so help, version, setup,
+    # and invalid arguments cannot mutate local state. Only the two retired
+    # command forms reach preflight first, allowing their canonical old skill
+    # to be upgraded before argparse reports the breaking interface change.
+    args = None if legacy_invocation else parser.parse_args(arguments)
     effective_data_dir = (
         data_dir if data_dir is not None else default_data_dir(home)
     )
@@ -307,27 +322,32 @@ def main(
         "sender_selector": sender_selector,
     }
 
-    if arguments == ["setup"]:
+    if args is not None and args.command == "setup":
         try:
             run_setup(**onboarding_options)
         except OnboardingError as error:
             print(f"Error: {error}", file=sys.stderr)
             raise SystemExit(2)
+        except KeyboardInterrupt:
+            print("Cancelled.", file=sys.stderr)
+            raise SystemExit(130)
         return
 
     try:
         setup_just_ran = ensure_installation(**onboarding_options)
     except OnboardingError as error:
-        print(f"Error: {error}", file=sys.stderr)
+        _write_event("error", message=str(error))
         raise SystemExit(2)
+    except KeyboardInterrupt:
+        _write_event("error", message="Recommendation workflow cancelled.")
+        raise SystemExit(130)
 
-    if not arguments:
-        if setup_just_ran:
-            return
-        parser.print_help(file=sys.stderr)
-        raise SystemExit(2)
+    if setup_just_ran:
+        return
 
-    args = parser.parse_args(arguments)
+    if args is None:
+        args = parser.parse_args(arguments)
+
     try:
         app_config = load_config(effective_config_file)
         if app_config is None:
@@ -335,43 +355,28 @@ def main(
                 f"DokuTipp config is missing after setup: {effective_config_file}"
             )
         excluded_channels = load_sender_filters(app_config.sender_filter_file)
-        if args.command == "fetch":
-            run_fetch(
-                data_dir=effective_data_dir,
-                limit=args.limit,
-                min_duration=args.min_duration,
-                excluded_channels=excluded_channels,
-                filter_file=args.filter_file,
-                history_file=history_file,
-                history_now=history_now,
-            )
-        elif args.command == "select":
-            run_select(
-                args.ids,
-                data_dir=effective_data_dir,
-                limit=args.limit,
-                min_duration=args.min_duration,
-                excluded_channels=excluded_channels,
-                filter_file=args.filter_file,
-                history_file=history_file,
-                history_now=history_now,
-            )
-        elif args.command == "setup":
-            # The exact `dokutipp setup` form was handled before preflight so it
-            # can deliberately reconfigure an existing installation.
-            parser.print_help(file=sys.stderr)
-            raise SystemExit(2)
-        else:
-            parser.print_help(file=sys.stderr)
-            raise SystemExit(2)
+        profile = load_profile(app_config.skill_root)
+        run_recommendations(
+            profile=profile,
+            data_dir=effective_data_dir,
+            min_duration=args.min_duration,
+            excluded_channels=excluded_channels,
+            filter_file=args.filter_file,
+            input_stream=input_stream,
+            history_file=history_file,
+            history_now=history_now,
+        )
     except (
         FilterConfigError,
         OnboardingError,
         RecommendationHistoryError,
         SelectionError,
     ) as error:
-        print(f"Error: {error}", file=sys.stderr)
+        _write_event("error", message=str(error))
         raise SystemExit(2)
+    except KeyboardInterrupt:
+        _write_event("error", message="Recommendation workflow cancelled.")
+        raise SystemExit(130)
 
 
 if __name__ == "__main__":

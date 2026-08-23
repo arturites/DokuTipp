@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import lzma
 import os
@@ -23,6 +24,20 @@ from .paths import (
 PROFILE_FILENAME = "PROFILE.md"
 SKILL_DIRECTORY_NAME = "dokutipp"
 SKILL_FILENAME = "SKILL.md"
+KNOWN_CANONICAL_SKILL_SHA256S = frozenset(
+    {
+        # Released canonical skills from v1.0.0 through v2.1.0. Exact hashes
+        # distinguish untouched bundled files from user-edited installations.
+        "7bfd3fedb222cc5301b3913d907153cd3df236e810227c3050c4472ce1565efa",
+        "2a254d0cd38012fe0eee42a7bed6cdda2fe542847bf35370daf107f4e2b82b33",
+        "f88882d48add9a507cc0a9ac1f9c3fee5ba76eeb53835875a693f8809ecee887",
+        "8f9e570d44a119ffd0ec57da910c3fbe8e4c3854d2276cafea247e71aa0c21c7",
+        "6497692638dab8b0512e39ee40886d436e638c01492a6dc8dc6abb74ba1ad97b",
+        "66b25eac1a94dee212b0d68adbd799cb1724c92c1b3d412fe4a407766a23828e",
+        "2f8cc3148a80bbd132a51dc8f732852a28ce8df702fa15209ffe99ff37524c29",
+        "7f4b7bd1a23793d63182c8f83397548cc75635c0d28c00abd4110cf335fad8ad",
+    }
+)
 INTERESTS_PROMPT = (
     "What documentary topics interest you? "
     "Enter them comma-separated on one line (for example: history, science, nature): "
@@ -558,6 +573,7 @@ def _ensure_skill_file(
     *,
     input_stream: TextIO,
     output_stream: TextIO,
+    allow_modified_replacement: bool = False,
 ) -> None:
     if skill_file.is_symlink():
         raise OnboardingError(f"SKILL.md must not be a symbolic link: {skill_file}")
@@ -573,6 +589,16 @@ def _ensure_skill_file(
         raise OnboardingError(f"Could not read SKILL.md {skill_file}: {error}") from error
     if installed_bytes == skill_bytes:
         return
+    if hashlib.sha256(installed_bytes).hexdigest() in KNOWN_CANONICAL_SKILL_SHA256S:
+        _write_skill(skill_file, skill_bytes)
+        output_stream.write(f"Updated SKILL.md at {skill_file}.\n")
+        return
+
+    if not allow_modified_replacement:
+        raise OnboardingError(
+            f"SKILL.md at {skill_file} contains local changes and was left "
+            "unchanged. Run `dokutipp setup` to review or replace it."
+        )
 
     _require_interactive(input_stream)
     if _prompt_confirmation(
@@ -696,6 +722,7 @@ def run_setup(
         skill_bytes,
         input_stream=input_stream,
         output_stream=output_stream,
+        allow_modified_replacement=True,
     )
     _ensure_profile_file(
         skill_directory / PROFILE_FILENAME,

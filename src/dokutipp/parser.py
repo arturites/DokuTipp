@@ -192,7 +192,6 @@ def available_channels(file_path: Union[str, Path]) -> Tuple[str, ...]:
 def parse_filmliste(
     file_path: Union[str, Path],
     *,
-    limit: Optional[int] = None,
     min_duration: int = 0,
     excluded_channels: Sequence[str] = (),
     filter_file: Optional[Union[str, Path]] = None,
@@ -259,9 +258,6 @@ def parse_filmliste(
             }
         )
 
-        if limit is not None and len(results) >= limit:
-            break
-
     return results
 
 
@@ -278,13 +274,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         description="Parse MediathekView Filmliste-akt.xz and output filtered JSON."
     )
     parser.add_argument("file", help="Path to Filmliste-akt.xz")
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=None,
-        metavar="N",
-        help="Maximum number of output entries (default: no limit)",
-    )
     parser.add_argument(
         "--min-duration",
         type=int,
@@ -315,7 +304,6 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         excluded_channels = load_sender_filters(args.sender_filter_file)
         results = parse_filmliste(
             args.file,
-            limit=args.limit,
             min_duration=args.min_duration,
             excluded_channels=excluded_channels,
             filter_file=args.filter_file,

@@ -5,6 +5,33 @@ All notable changes to DokuTipp are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Add a CLI-owned recursive selection workflow that presents bounded candidate
+  sets as newline-delimited JSON requests on stderr and accepts raw 3+1 ID
+  selections on stdin.
+- Retry invalid selections against the unchanged candidate request without
+  losing candidates or requiring the selecting agent to manage workflow state.
+
+### Changed
+
+- Make bare `dokutipp` the persistent interactive recommendation command and
+  reserve stdout for the final CLI-rendered Markdown.
+- Move `--min-duration` and `--filter-file` to the top-level recommendation
+  command.
+- Reduce the installed agent skill to profile-guided selection for the current
+  request while the CLI owns batching, rounds, validation, and termination.
+- Automatically update installed, unmodified copies of known previously
+  released bundled skills while continuing to protect locally edited files.
+
+### Removed
+
+- Remove the `fetch` and `select` subcommands and their two-step integration
+  contract.
+- Remove the public `--limit` option.
+
 ## [2.1.0] - 2026-08-21
 
 ### Added
